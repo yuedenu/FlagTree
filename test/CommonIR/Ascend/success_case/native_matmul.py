@@ -96,13 +96,18 @@ def matmul_kernel(
 # =============================================================================
 #  Host-side launch
 # =============================================================================
-def call(mat_a, mat_b, num_cores=_DEFAULT_NUM_CORES):
+def call(mat_a, mat_b, num_cores=_DEFAULT_NUM_CORES, custom_pipeline=None, debug_compile=False):
     m = mat_a.shape[0]
     k = mat_a.shape[1]
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
+    compile_options = {}
+    if custom_pipeline is not None:
+        compile_options["custom_pipeline"] = custom_pipeline
+    if debug_compile:
+        compile_options["debug"] = True
     matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K)
+                                 BLOCK_K=BLOCK_K, **compile_options)
     return mat_c
 
 
@@ -305,6 +310,18 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
     parser.add_argument("--num-cores", type=int, default=None)
     parser.add_argument("--no-check", action="store_true")
+    parser.add_argument(
+        "--custom-pipeline",
+        default=None,
+        help=("BishengIR optimization-group whitelist, for example "
+              "'builtin.module(multi-buffer-pipeline,code-motion)'. "
+              "Omit this option to use the default compilation pipeline."),
+    )
+    parser.add_argument(
+        "--debug-compile",
+        action="store_true",
+        help="Print the backend compiler command and dump intermediate IR.",
+    )
     parser.add_argument("--dump-ttir", nargs="?", const="", default=None,
                         help="Dump TTIR to PATH and exit; no device needed.")
     parser.add_argument("--dump-linalg", nargs="?", const="", default=None,
@@ -328,7 +345,8 @@ if __name__ == "__main__":
     mat_a = torch.randn((M, K), dtype=torch.float16, device=device)
     mat_b = torch.randn((K, N), dtype=torch.float16, device=device)
 
-    mat_c = call(mat_a, mat_b, num_cores)
+    mat_c = call(mat_a, mat_b, num_cores, custom_pipeline=args.custom_pipeline,
+                 debug_compile=args.debug_compile)
 
     if not args.no_check:
         ref = torch.matmul(mat_a.float(), mat_b.float()).to(torch.float16)
