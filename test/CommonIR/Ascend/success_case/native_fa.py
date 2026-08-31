@@ -599,7 +599,7 @@ def dump_linalg(path=None, combine_batch=32, is_causal=False):
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False, custom_pipeline=None, debug_compile=False):
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -611,11 +611,6 @@ class _attention(torch.autograd.Function):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
-        compile_options = {}
-        if custom_pipeline is not None:
-            compile_options["custom_pipeline"] = custom_pipeline
-        if debug_compile:
-            compile_options["debug"] = True
         _attn_fwd[grid](
             q, k, v, sm_scale, M, o,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
@@ -625,7 +620,6 @@ class _attention(torch.autograd.Function):
             q.shape[0], q.shape[1], q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
-            **compile_options,
         )
 
         ctx.save_for_backward(q, k, v, o, M)
@@ -643,14 +637,14 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
-def flash_attention_fwd(q, k, v, combine_batch=None, is_causal=False, custom_pipeline=None, debug_compile=False):
+def flash_attention_fwd(q, k, v, combine_batch=None, is_causal=False):
     """Host launcher: wraps the Flash Attention v2 forward kernel.
 
     `combine_batch` is accepted for CLI compatibility but unused — the FA v2
     kernel does not tile over KV blocks in a combine-batch fashion.
     """
     sm_scale = q.shape[-1]**-0.5
-    return attention(q, k, v, is_causal, sm_scale, False, custom_pipeline, debug_compile)
+    return attention(q, k, v, is_causal, sm_scale, False)
 
 
 if __name__ == "__main__":
@@ -664,10 +658,6 @@ if __name__ == "__main__":
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--combine-batch", type=int, default=8, help="KV blocks per task (arch22 nRatio)")
-    parser.add_argument("--custom-pipeline", default=None,
-                        help="BishengIR optimization-group whitelist; omit to use the default pipeline.")
-    parser.add_argument("--debug-compile", action="store_true",
-                        help="Print the backend compiler command and dump intermediate IR.")
     parser.add_argument(
         "--dump-mlir", nargs="?", const="", default=None,
         help="Dump intermediate TileIR to PATH (default skill/op/fa_triton_arch.mlir) and exit; no device needed.")
@@ -704,8 +694,7 @@ if __name__ == "__main__":
     k = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
     v = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
 
-    out = flash_attention_fwd(q, k, v, combine_batch, is_causal=args.causal,
-                              custom_pipeline=args.custom_pipeline, debug_compile=args.debug_compile)
+    out = flash_attention_fwd(q, k, v, combine_batch, is_causal=args.causal)
 
     if not args.no_check:
 
