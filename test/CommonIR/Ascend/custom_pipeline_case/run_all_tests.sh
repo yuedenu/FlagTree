@@ -7,7 +7,7 @@
 #   ./run_all_tests.sh native_matmul.py native_fa.py  # 只运行指定文件
 #
 # 每个用例的 pipeline 已固定写入 Python kernel launch：
-#   builtin.module(multi-buffer-pipeline,code-motion)
+#   
 # ==============================================================================
 
 set -euo pipefail
@@ -123,7 +123,7 @@ if [ ${#TEST_FILES[@]} -eq 0 ]; then
 fi
 
 echo "共发现 ${#TEST_FILES[@]} 个测试文件，每个文件执行 1 次固定 pipeline:"
-echo "  builtin.module(multi-buffer-pipeline,code-motion)"
+echo "  "
 echo ""
 
 for f in "${TEST_FILES[@]}"; do

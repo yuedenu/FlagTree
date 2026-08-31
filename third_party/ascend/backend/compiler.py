@@ -371,7 +371,8 @@ def get_common_bishengir_compile_options(metadata):
 
 def _append_custom_pipeline_option(compile_options, metadata):
     custom_pipeline = metadata.get("custom_pipeline")
-    if custom_pipeline is not None:
+    enable_custom_pipeline = custom_pipeline is not None
+    if enable_custom_pipeline:
         compile_options.append(f"--custom-compilation-pipeline={custom_pipeline}")
 
 

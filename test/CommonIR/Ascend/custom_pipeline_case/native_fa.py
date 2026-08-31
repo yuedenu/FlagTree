@@ -623,7 +623,7 @@ class _attention(torch.autograd.Function):
             q.shape[0], q.shape[1], q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
-            custom_pipeline="builtin.module(multi-buffer-pipeline,code-motion)",
+            custom_pipeline="",
             **compile_options,
         )
 

@@ -114,7 +114,7 @@ def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES, debug_compile=Fal
         compile_options["debug"] = True
     matmul_add_residual_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, m, n, k, num_cores, BLOCK_M=BLOCK_M,
                                               BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                                              custom_pipeline="builtin.module(multi-buffer-pipeline,code-motion)", **compile_options)
+                                              custom_pipeline="", **compile_options)
     return mat_c
 
 

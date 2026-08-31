@@ -802,7 +802,7 @@ def flash_attention_fwd(q, k, v, is_causal=False, debug_compile=False):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         DIM=DIM,
-        custom_pipeline="builtin.module(multi-buffer-pipeline,code-motion)",
+        custom_pipeline="",
         **compile_options,
     )
     return out
