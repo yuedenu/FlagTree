@@ -5,6 +5,14 @@ import torch
 import triton
 import triton.language as tl
 
+pipeline = "hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1"
+
+# =============================================================================
+#  TLE / tile-dialect registration (needed for the dump pipeline)
+# =============================================================================
+import triton.experimental.tle as tle  # noqa: F401  (registers tile/tle dialects)
+from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor
+
 # =============================================================================
 #  Compile-time configuration
 # =============================================================================
@@ -14,313 +22,162 @@ BLOCK_N = 32
 DIM = 32
 
 # =============================================================================
-#  Step sub-functions (each called from the main kernel; decorated @triton.jit
-#  so the compiler sees them as inlinable device functions).
+#  Flash Attention v2 kernels (ported from 06-fused-attention.py)
 # =============================================================================
 
-
-@triton.jit
-def _mm1_qkt(
-    # inputs
-    K,
-    q_block,  # pre-loaded Q tensor (BLOCK_M, DIM), passed from outer loop
-    workspace_s,
-    # task geometry
-    cid,
-    kv_idx,
-    batch_idx,
-    kv_head_idx,
-    # strides
-    sKb,
-    sKh,
-    sKs,
-    sKd,
-    S,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    DIM: tl.constexpr,
-):
-    """MM1: compute S = Q * K^T for one KV block and store into workspace_s."""
-    k_bp = tl.make_block_ptr(K + batch_idx * sKb + kv_head_idx * sKh, (S, DIM), (sKs, sKd), (kv_idx * BLOCK_N, 0),
-                             (BLOCK_N, DIM), (1, 0))
-    k_block = tl.load(k_bp)
-
-    # attn_score = Q * K^T  — K is (BLOCK_N, DIM), transpose to (DIM, BLOCK_N)
-    attn_score = tl.dot(q_block, tl.trans(k_block), tl.zeros((BLOCK_M, BLOCK_N), tl.float32))
-
-    score_store_bp = tl.make_block_ptr(workspace_s + cid * BLOCK_M * BLOCK_N, (BLOCK_M, BLOCK_N), (BLOCK_N, 1), (0, 0),
-                                       (BLOCK_M, BLOCK_N), (1, 0))
-    tl.store(score_store_bp, attn_score.to(workspace_s.dtype.element_ty))
+# constexpr shape literals for tile_copy (must be tl.constexpr)
+CBM = tl.constexpr(BLOCK_M)
+CBN = tl.constexpr(BLOCK_N)
+CD = tl.constexpr(DIM)
 
 
 @triton.jit
-def _mm2_pv(
-    # inputs
-    V,
-    workspace_p,
-    workspace_pv,
-    # task geometry
-    cid,
-    kv_idx,
-    batch_idx,
-    kv_head_idx,
-    # strides
-    sKb,
-    sKh,
-    sKs,
-    sKd,
-    S,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    DIM: tl.constexpr,
-):
-    """MM2: compute O_part = P * V for one KV block and store into workspace_pv."""
-    v_bp = tl.make_block_ptr(V + batch_idx * sKb + kv_head_idx * sKh, (S, DIM), (sKs, sKd), (kv_idx * BLOCK_N, 0),
-                             (BLOCK_N, DIM), (1, 0))
-    v_block = tl.load(v_bp)
+def _attn_fwd_inner(acc, l_i, m_i, q_l1,  #
+                    K, V, k_l1, v_l1,  #
+                    stride_kn, stride_kd, stride_vn, stride_vd,  #
+                    start_m, qk_scale,  #
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  #
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  #
+                    N_CTX: tl.constexpr):
+    # range of values handled by this stage
+    if STAGE == 1:
+        lo, hi = 0, start_m * BLOCK_M
+    elif STAGE == 2:
+        lo, hi = start_m * BLOCK_M, (start_m + 1) * BLOCK_M
+        lo = tl.multiple_of(lo, BLOCK_M)
+    else:  # causal = False
+        lo, hi = 0, N_CTX
+    # loop over k, v and update accumulator
+    for start_n in tl.range(lo, hi, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        # DMA K block: GM -> L1
+        k_bp = tl.make_block_ptr(K, (N_CTX, HEAD_DIM), (stride_kn, stride_kd), (start_n, 0), (BLOCK_N, HEAD_DIM),
+                                 (1, 0))
+        tile_copy(k_bp, k_l1, [tl.constexpr(BLOCK_N), tl.constexpr(HEAD_DIM)])
+        # -- compute qk from L1 buffers --
+        q = tile_to_tensor(q_l1, writable=False)
+        k = tile_to_tensor(k_l1, writable=False)
+        qk = tl.dot(q, tl.trans(k))
+        if STAGE == 2:
+            mask = offs_m[:, None] >= (start_n + offs_n[None, :])
+            qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk -= m_ij[:, None]
+        else:
+            m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
+            qk = qk * qk_scale - m_ij[:, None]
+        p = tl.math.exp2(qk)
+        # -- compute correction factor
+        alpha = tl.math.exp2(m_i - m_ij)
+        l_ij = tl.sum(p, 1)
+        # -- update output accumulator --
+        acc = acc * alpha[:, None]
+        # DMA V block: GM -> L1
+        v_bp = tl.make_block_ptr(V, (N_CTX, HEAD_DIM), (stride_vn, stride_vd), (start_n, 0), (BLOCK_N, HEAD_DIM),
+                                 (1, 0))
+        tile_copy(v_bp, v_l1, [tl.constexpr(BLOCK_N), tl.constexpr(HEAD_DIM)])
+        v = tile_to_tensor(v_l1, writable=False)
+        acc = tl.dot(p.to(tl.float16), v, acc)
+        # update m_i and l_i
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+    return acc, l_i, m_i
 
-    prob_load_bp = tl.make_block_ptr(workspace_p + cid * BLOCK_M * BLOCK_N, (BLOCK_M, BLOCK_N), (BLOCK_N, 1), (0, 0),
-                                     (BLOCK_M, BLOCK_N), (1, 0))
-    p_block = tl.load(prob_load_bp)
 
-    # pv_part = P * V  — (BLOCK_M, BLOCK_N) @ (BLOCK_N, DIM) = (BLOCK_M, DIM)
-    pv_part = tl.dot(p_block, v_block, tl.zeros((BLOCK_M, DIM), tl.float32))
-
-    pv_store_bp = tl.make_block_ptr(workspace_pv + cid * BLOCK_M * DIM, (BLOCK_M, DIM), (DIM, 1), (0, 0),
-                                    (BLOCK_M, DIM), (1, 0))
-    tl.store(pv_store_bp, pv_part.to(workspace_pv.dtype.element_ty))
+configs = [
+    triton.Config({'BLOCK_M': BM, 'BLOCK_N': BN}, num_stages=s, num_warps=w)
+    for BM in [32, 64, 128]
+    for BN in [32, 64]
+    for s in [1, 2]
+    for w in [4, 8]
+]
 
 
+def keep(conf):
+    BLOCK_M = conf.kwargs["BLOCK_M"]
+    BLOCK_N = conf.kwargs["BLOCK_N"]
+    return BLOCK_M >= BLOCK_N
+
+
+def prune_invalid_configs(configs, named_args, **kwargs):
+    N_CTX = kwargs["N_CTX"]
+    STAGE = kwargs["STAGE"]
+    return [
+        conf for conf in configs if conf.kwargs.get("BLOCK_M", 0) <= N_CTX and (
+            conf.kwargs.get("BLOCK_M", 0) >= conf.kwargs.get("BLOCK_N", 0) or STAGE == 1)
+    ]
+
+
+@triton.autotune(configs=list(filter(keep, configs)), key=["N_CTX", "HEAD_DIM", "STAGE"])
 @triton.jit
-def _vec1_softmax(
-    workspace_s,
-    workspace_p,
-    cid,
-    kv_idx,
-    running_neg_max,
-    sm_scale,
-    IS_CAUSAL: tl.constexpr,
-    global_head_idx,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    """Vec1: softmax over one score block -> workspace_p.
+def _attn_fwd(Q, K, V, sm_scale, M, Out,  #
+              stride_qb, stride_qh, stride_qm, stride_qd,  #
+              stride_kb, stride_kh, stride_kn, stride_kd,  #
+              stride_vb, stride_vh, stride_vn, stride_vd,  #
+              stride_ob, stride_oh, stride_om, stride_od,  #
+              Z, H, N_CTX,  #
+              HEAD_DIM: tl.constexpr,  #
+              BLOCK_M: tl.constexpr,  #
+              BLOCK_N: tl.constexpr,  #
+              STAGE: tl.constexpr,  #
+              ):
+    tl.static_assert(BLOCK_N <= HEAD_DIM)
+    start_m = tl.program_id(0)
+    off_hz = tl.program_id(1)
+    off_z = off_hz // H
+    off_h = off_hz % H
 
-    Takes running_neg_max as an in-register accumulator (passed from main loop).
-    Returns (rescale, block_expsum, new_neg_max) for use by Vec2 in the same iter.
-    """
-    # load score written by MM1
-    score_load_bp = tl.make_block_ptr(workspace_s + cid * BLOCK_M * BLOCK_N, (BLOCK_M, BLOCK_N), (BLOCK_N, 1), (0, 0),
-                                      (BLOCK_M, BLOCK_N), (1, 0))
-    attn_score_block = tl.load(score_load_bp).to(tl.float32)
+    # base pointers for this (batch, head)
+    Q_ptr = Q + off_z * stride_qb + off_h * stride_qh
+    K_ptr = K + off_z * stride_kb + off_h * stride_kh
+    V_ptr = V + off_z * stride_vb + off_h * stride_vh
+    O_ptr = Out + off_z * stride_ob + off_h * stride_oh
 
-    if IS_CAUSAL:
-        q_row_idx = global_head_idx * BLOCK_M + tl.arange(0, BLOCK_M)
-        kv_col_idx = kv_idx * BLOCK_N + tl.arange(0, BLOCK_N)
-        causal_mask = q_row_idx[:, None] >= kv_col_idx[None, :]
-        attn_score_block = tl.where(causal_mask, attn_score_block, float("-inf"))
+    # ---- allocate L1 buffers for Q, K, V ----
+    q_l1 = tile_alloc([tl.constexpr(BLOCK_M), tl.constexpr(HEAD_DIM)], tl.float16, tle.language.dsa.ascend.L1)
+    k_l1 = tile_alloc([tl.constexpr(BLOCK_N), tl.constexpr(HEAD_DIM)], tl.float16, tle.language.dsa.ascend.L1)
+    v_l1 = tile_alloc([tl.constexpr(BLOCK_N), tl.constexpr(HEAD_DIM)], tl.float16, tle.language.dsa.ascend.L1)
 
-    block_row_max = tl.max(attn_score_block, axis=-1, keep_dims=True)
-    new_neg_max = tl.minimum(-block_row_max * sm_scale, running_neg_max)
-    rescale = tl.exp(new_neg_max - running_neg_max)  # <= 1
-    softmax_p = tl.exp(sm_scale * attn_score_block + new_neg_max)
-    block_expsum = tl.sum(softmax_p, axis=-1, keep_dims=True)
+    # DMA Q tile into L1 once; it stays resident for the full KV loop
+    q_bp = tl.make_block_ptr(Q_ptr, (N_CTX, HEAD_DIM), (stride_qm, stride_qd), (start_m * BLOCK_M, 0),
+                             (BLOCK_M, HEAD_DIM), (1, 0))
+    tile_copy(q_bp, q_l1, [tl.constexpr(BLOCK_M), tl.constexpr(HEAD_DIM)])
 
-    # softmax_p -> workspace_p (read by MM2)
-    prob_bp = tl.make_block_ptr(workspace_p + cid * BLOCK_M * BLOCK_N, (BLOCK_M, BLOCK_N), (BLOCK_N, 1), (0, 0),
-                                (BLOCK_M, BLOCK_N), (1, 0))
-    tl.store(prob_bp, softmax_p.to(workspace_p.dtype.element_ty))
-
-    return rescale, block_expsum, new_neg_max
-
-
-@triton.jit
-def _vec2_accumulate(
-    workspace_pv,
-    cid,
-    acc_o,
-    softmax_denom,
-    rescale,
-    block_expsum,
-    BLOCK_M: tl.constexpr,
-    DIM: tl.constexpr,
-):
-    """Vec2: rescale acc_o and accumulate one KV block's P*V.
-
-    Takes and returns (acc_o, softmax_denom) as in-register accumulators.
-    Finalization (divide by denom) is done in the main loop after the last KV block.
-    """
-    # load pv_part written by MM2
-    pv_bp = tl.make_block_ptr(workspace_pv + cid * BLOCK_M * DIM, (BLOCK_M, DIM), (DIM, 1), (0, 0), (BLOCK_M, DIM),
-                              (1, 0))
-    pv_acc = tl.load(pv_bp).to(tl.float32)
-
-    # rescale and accumulate
-    rescale_bc = tl.broadcast_to(rescale, (BLOCK_M, DIM))
-    acc_o = acc_o * rescale_bc + pv_acc
-    softmax_denom = softmax_denom * rescale + block_expsum
-
-    return acc_o, softmax_denom
-
-
-# =============================================================================
-#  Serial single-slot FA kernel — no sync, no tle.scope (TileIR / tle.dsa form)
-#
-#  Outer loop: one output tile per iteration.
-#  Inner loop: MM1 → Vec1 → MM2 → Vec2 for each KV block.
-#  Softmax accumulators (acc_o, softmax_denom, running_neg_max) are local
-#  registers declared before the inner loop; finalization after the inner loop.
-#
-#  grid = (NUM_CORES,). Each program drives one Cube + one Vector engine.
-# =============================================================================
-@triton.jit
-def flash_attention_fwd_3task_kernel(
-    Q,
-    K,
-    V,
-    Out,
-    workspace_s,
-    workspace_p,
-    workspace_pv,  # transient per-KV-block workspaces
-    sm_scale,
-    B,
-    Hq,
-    Hkv,
-    S,
-    sQb,
-    sQh,
-    sQs,
-    sQd,
-    sKb,
-    sKh,
-    sKs,
-    sKd,
-    sOb,
-    sOh,
-    sOs,
-    sOd,
-    block_num_per_core,
-    rem_block_num,
-    NUM_KV_BLOCKS: tl.constexpr,
-    IS_CAUSAL: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    DIM: tl.constexpr,
-):
-    cid = tl.program_id(0)
-
-    # ---- derive loop-geometry scalars ----
-    num_seq_blocks = S // BLOCK_M
-    gqa_group = Hq // Hkv
-
-    # ---- static task distribution ----
-    block_start = cid * block_num_per_core + tl.where(cid < rem_block_num, cid, rem_block_num)
-    block_num = block_num_per_core + tl.where(cid < rem_block_num, 1, 0)
-
-    # =========================================================================
-    #  Outer loop: one output tile per iteration.
-    # =========================================================================
-    for tile_idx in range(block_num):
-        output_block_id = block_start + tile_idx
-        global_head_idx = output_block_id % num_seq_blocks
-        head_idx = (output_block_id // num_seq_blocks) % Hq
-        batch_idx = output_block_id // (num_seq_blocks * Hq)
-        kv_head_idx = head_idx // gqa_group
-
-        # ---- load Q for this tile once; reused across all KV blocks ----
-        q_bp = tl.make_block_ptr(Q + batch_idx * sQb + head_idx * sQh, (S, DIM), (sQs, sQd),
-                                 (global_head_idx * BLOCK_M, 0), (BLOCK_M, DIM), (1, 0))
-        q_block = tl.load(q_bp)
-
-        # ---- per-tile softmax accumulators (local registers) ----
-        acc_o = tl.zeros((BLOCK_M, DIM), tl.float32)
-        softmax_denom = tl.zeros((BLOCK_M, 1), tl.float32)
-        running_neg_max = tl.full((BLOCK_M, 1), 2**30, tl.float32)
-
-        # =========================================================================
-        #  Inner loop: MM1 → Vec1 → MM2 → Vec2 per KV block (serial, no sync).
-        # =========================================================================
-        for kv_idx in range(NUM_KV_BLOCKS):
-
-            # ===== Step 1: MM1 — S = Q * K^T =====
-            _mm1_qkt(
-                K,
-                q_block,
-                workspace_s,
-                cid,
-                kv_idx,
-                batch_idx,
-                kv_head_idx,
-                sKb,
-                sKh,
-                sKs,
-                sKd,
-                S,
-                BLOCK_M,
-                BLOCK_N,
-                DIM,
-            )
-
-            # Barrier: ensure MM1's store to workspace_s is visible to Vec1's load.
-            tl.debug_barrier()
-
-            # ===== Step 2: Vec1 — softmax(S) → P; returns rescale, expsum, new_neg_max =====
-            rescale, block_expsum, running_neg_max = _vec1_softmax(
-                workspace_s,
-                workspace_p,
-                cid,
-                kv_idx,
-                running_neg_max,
-                sm_scale,
-                IS_CAUSAL,
-                global_head_idx,
-                BLOCK_M,
-                BLOCK_N,
-            )
-
-            # Barrier: ensure Vec1's store to workspace_p is visible to MM2's load.
-            tl.debug_barrier()
-
-            # ===== Step 3: MM2 — O_part = P * V =====
-            _mm2_pv(
-                V,
-                workspace_p,
-                workspace_pv,
-                cid,
-                kv_idx,
-                batch_idx,
-                kv_head_idx,
-                sKb,
-                sKh,
-                sKs,
-                sKd,
-                S,
-                BLOCK_M,
-                BLOCK_N,
-                DIM,
-            )
-
-            # Barrier: ensure MM2's store to workspace_pv is visible to Vec2's load.
-            tl.debug_barrier()
-
-            # ===== Step 4: Vec2 — rescale and accumulate; returns updated accumulators =====
-            acc_o, softmax_denom = _vec2_accumulate(
-                workspace_pv,
-                cid,
-                acc_o,
-                softmax_denom,
-                rescale,
-                block_expsum,
-                BLOCK_M,
-                DIM,
-            )
-
-        # ---- finalize: write output for this tile ----
-        denom_bc = tl.broadcast_to(softmax_denom, (BLOCK_M, DIM))
-        out_block = (acc_o / denom_bc).to(Out.dtype.element_ty)
-        o_bp = tl.make_block_ptr(Out + batch_idx * sOb + head_idx * sOh, (S, DIM), (sOs, sOd),
-                                 ((global_head_idx * BLOCK_M).to(tl.int32), 0), (BLOCK_M, DIM), (1, 0))
-        tl.store(o_bp, out_block)
+    # initialize offsets
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    # initialize pointer to m and l
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+    # load scales
+    qk_scale = sm_scale * 1.44269504  # 1/log(2)
+    # stage 1: off-band (causal only); stage 3: full non-causal
+    # For causal=True,  STAGE=3 → inner called with STAGE=1 (off-band) then STAGE=2 (on-band)
+    # For causal=False, STAGE=1 → inner called with STAGE=3 (all)
+    if STAGE & 1:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q_l1,  #
+                                        K_ptr, V_ptr, k_l1, v_l1,  #
+                                        stride_kn, stride_kd, stride_vn, stride_vd,  #
+                                        start_m, qk_scale,  #
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                        4 - STAGE, offs_m, offs_n, N_CTX)
+    # stage 2: on-band (diagonal, causal mask)
+    if STAGE & 2:
+        acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q_l1,  #
+                                        K_ptr, V_ptr, k_l1, v_l1,  #
+                                        stride_kn, stride_kd, stride_vn, stride_vd,  #
+                                        start_m, qk_scale,  #
+                                        BLOCK_M, HEAD_DIM, BLOCK_N,  #
+                                        2, offs_m, offs_n, N_CTX)
+    # epilogue
+    m_i += tl.math.log2(l_i)
+    acc = acc / l_i[:, None]
+    m_ptrs = M + off_hz * N_CTX + offs_m
+    tl.store(m_ptrs, m_i)
+    o_bp = tl.make_block_ptr(O_ptr, (N_CTX, HEAD_DIM), (stride_om, stride_od), (start_m * BLOCK_M, 0),
+                             (BLOCK_M, HEAD_DIM), (1, 0))
+    tl.store(o_bp, acc.to(tl.float16))
 
 
 # =============================================================================
@@ -344,29 +201,34 @@ class _DumpOptions:
 
 
 def _dump_signature():
-    """Static signature for ast_to_ttir (pointers / scalars / i32 / constexpr)."""
-    ptr = {
-        "Q": "*fp16", "K": "*fp16", "V": "*fp16", "Out": "*fp16", "workspace_s": "*fp16", "workspace_p": "*fp16",
-        "workspace_pv": "*fp16"
-    }
-    i32_names = [
-        "B", "Hq", "Hkv", "S", "sQb", "sQh", "sQs", "sQd", "sKb", "sKh", "sKs", "sKd", "sOb", "sOh", "sOs", "sOd",
-        "block_num_per_core", "rem_block_num"
-    ]
-    sig = dict(ptr)
+    """Static signature for ast_to_ttir (pointers / scalars / i32 / constexpr).
+
+    Matches _attn_fwd: Q, K, V, sm_scale, M, Out, strides, Z, H, N_CTX,
+    HEAD_DIM, BLOCK_M, BLOCK_N, STAGE.
+    """
+    sig = {}
+    # tensor pointers
+    for name in ("Q", "K", "V", "Out"):
+        sig[name] = "*fp16"
     sig["sm_scale"] = "fp32"
-    for n in i32_names:
-        sig[n] = "i32"
-    sig["NUM_KV_BLOCKS"] = "constexpr"
-    sig["IS_CAUSAL"] = "constexpr"
+    sig["M"] = "*fp32"
+    # strides: q, k, v, o — each has b/h/m/d
+    for t in ("q", "k", "v", "o"):
+        for dim in ("b", "h", ("m" if t in ("q", "o") else "n"), "d"):
+            sig[f"stride_{t}{dim}"] = "i32"
+    sig["Z"] = "i32"
+    sig["H"] = "i32"
+    sig["N_CTX"] = "i32"
+    # constexprs
+    sig["HEAD_DIM"] = "constexpr"
     sig["BLOCK_M"] = "constexpr"
     sig["BLOCK_N"] = "constexpr"
-    sig["DIM"] = "constexpr"
+    sig["STAGE"] = "constexpr"
     return sig
 
 
-def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, is_causal=False):
-    """Compile the kernel to TTIR (containing tile.* ops) and write it to `path`.
+def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, combine_batch=8, is_causal=False):
+    """Compile _attn_fwd to TTIR and write it to `path`.
 
     Also runs the TileIR→HIVM pass to lower tile.* ops and dumps the resulting
     pure TTIR to `ttir_path`. Requires no NPU/GPU — pure front-end compilation.
@@ -376,12 +238,7 @@ def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, is_causal=False):
     from triton.compiler.compiler import ASTSource
     from triton.compiler.code_generator import ast_to_ttir
     from triton._C.libtriton import ir
-    try:
-        from triton._C.libtriton import tle as tle_ir
-        _has_tle_ir = True
-    except Exception:
-        tle_ir = None
-        _has_tle_ir = False
+    from triton._C.libtriton import tle as tle_ir
 
     # The kernel reads module-level shape constants (BLOCK_M, DIM, ...) as plain
     # globals; allow that during this front-end-only dump.
@@ -392,21 +249,20 @@ def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, is_causal=False):
     if ttir_path is None:
         ttir_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fa_triton_arch_ttir.mlir")
 
+    stage = 3 if is_causal else 1
     signature = _dump_signature()
     constants = {
-        "NUM_KV_BLOCKS": num_kv_blocks,
-        "IS_CAUSAL": is_causal,
+        "HEAD_DIM": DIM,
         "BLOCK_M": BLOCK_M,
         "BLOCK_N": BLOCK_N,
-        "DIM": DIM,
+        "STAGE": stage,
     }
 
-    src = ASTSource(flash_attention_fwd_3task_kernel, signature, constants)
+    src = ASTSource(_attn_fwd, signature, constants)
     context = ir.context()
     ir.load_dialects(context)
-    if _has_tle_ir:
-        tle_ir.load_dialects(context)
-        tle_ir.load_tile_dialects(context)
+    tle_ir.load_dialects(context)
+    tle_ir.dsa_ir.load_tile_dialects(context)
     # Ascend dialect is optional (only needed for ascend-specific ops); load if present.
     try:
         from triton._C.libtriton.ascend import ir as ascend_ir
@@ -417,7 +273,7 @@ def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, is_causal=False):
     # codegen_fns: tl.dot needs a target-provided "min_dot_size"; the ascend
     # backend simply returns (1,1,1), so supply that inline (no full backend).
     codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
-    module = ast_to_ttir(flash_attention_fwd_3task_kernel, src, context, _DumpOptions(), codegen_fns, {})
+    module = ast_to_ttir(_attn_fwd, src, context, _DumpOptions(), codegen_fns, {})
 
     # Ensure the produced IR is legal before writing it out.
     ok = module.verify()
@@ -480,7 +336,7 @@ def dump_tileir(path=None, ttir_path=None, num_kv_blocks=32, is_causal=False):
     return mlir
 
 
-def dump_hivm(path=None, is_causal=False):
+def dump_hivm(path=None, combine_batch=32, is_causal=False):
     """Compile the kernel to TTIR, then lower through TileIR→HIVM pipeline to HIVM IR.
 
     Pipeline (matches compiler.py ttir_to_linalg):
@@ -500,7 +356,7 @@ def dump_hivm(path=None, is_causal=False):
     from triton._C.libtriton import ir, passes, ascend
 
     # Step 1: compile to TTIR (TileIR)
-    tileir_mlir = dump_tileir(path=None, is_causal=is_causal)
+    tileir_mlir = dump_tileir(path=None, combine_batch=combine_batch, is_causal=is_causal)
 
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fa_triton_arch_hivm.mlir")
@@ -508,12 +364,9 @@ def dump_hivm(path=None, is_causal=False):
     # Step 2: parse the TileIR module and run the pass pipeline
     context = ir.context()
     ir.load_dialects(context)
-    try:
-        from triton._C.libtriton import tle as tle_ir
-        tle_ir.load_dialects(context)
-        tle_ir.load_tile_dialects(context)
-    except Exception:
-        pass
+    from triton._C.libtriton import tle as tle_ir
+    tle_ir.load_dialects(context)
+    tle_ir.dsa_ir.load_tile_dialects(context)
     try:
         from triton._C.libtriton.ascend import ir as ascend_ir
         ascend_ir.load_dialects(context)
@@ -565,7 +418,7 @@ def dump_hivm(path=None, is_causal=False):
     return mlir
 
 
-def dump_linalg(path=None, is_causal=False):
+def dump_linalg(path=None, combine_batch=32, is_causal=False):
     """Compile the kernel through the full TileIR→Linalg lowering pipeline.
 
     Pipeline:
@@ -596,9 +449,10 @@ def dump_linalg(path=None, is_causal=False):
     Returns the final Linalg MLIR string.  No NPU/GPU required.
     """
     from triton._C.libtriton import ir, passes, ascend
+    from triton._C.libtriton import tle as tle_ir
 
     # Step 1: compile to TTIR (TileIR)
-    tileir_mlir = dump_tileir(path=None, is_causal=is_causal)
+    tileir_mlir = dump_tileir(path=None, combine_batch=combine_batch, is_causal=is_causal)
 
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fa_triton_arch_linalg.mlir")
@@ -606,12 +460,8 @@ def dump_linalg(path=None, is_causal=False):
     # Step 2: parse the TileIR module into a fresh context
     context = ir.context()
     ir.load_dialects(context)
-    try:
-        from triton._C.libtriton import tle as tle_ir
-        tle_ir.load_dialects(context)
-        tle_ir.load_tile_dialects(context)
-    except Exception:
-        pass
+    tle_ir.load_dialects(context)
+    tle_ir.dsa_ir.load_tile_dialects(context)
     try:
         from triton._C.libtriton.ascend import ir as ascend_ir
         ascend_ir.load_dialects(context)
@@ -639,25 +489,25 @@ def dump_linalg(path=None, is_causal=False):
     #       cast memref<,#space>   -> tensor  =>  memref.memory_space_cast + bufferization.to_tensor
     #     so the linalg-incubator never sees the unresolved materializations
     #     that cause "unresolved materialization" failures.
-    pm = ir.pass_manager(context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_erase_linalg_casts(pm)
-    passes.common.add_canonicalizer(pm)
-    pm.run(module)
-    print(f"[dump_linalg] ①b erase_linalg_casts: verify={module.verify()}", flush=True)
+    # pm = ir.pass_manager(context)
+    # pm.enable_debug()
+    # ascend.passes.ttir.add_erase_linalg_casts(pm)
+    # passes.common.add_canonicalizer(pm)
+    # pm.run(module)
+    # print(f"[dump_linalg] ①b erase_linalg_casts: verify={module.verify()}", flush=True)
 
     # ── ② Structured (r1) + discrete mask ────────────────────────────────
     pm = ir.pass_manager(context)
     pm.enable_debug()
-    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
-    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False)
+    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False, False)
     pm.run(module)
     print(f"[dump_linalg] ② structure(r1)+discrete_mask: verify={module.verify()}", flush=True)
 
     # ── ③ Unstructured + HIVM + HFusion + LLVM ──────────────────────────
     pm = ir.pass_manager(context)
     pm.enable_debug()
-    ascend.passes.ttir.add_triton_to_unstructure_incubated(pm, False, False)
+    ascend.passes.ttir.add_triton_to_unstructure(pm, False, False)
     ascend.passes.ttir.add_triton_to_hivm(pm)
     ascend.passes.ttir.add_triton_to_hfusion(pm)
     ascend.passes.ttir.add_triton_to_llvm(pm)
@@ -668,7 +518,7 @@ def dump_linalg(path=None, is_causal=False):
     pm = ir.pass_manager(context)
     pm.enable_debug()
     ascend.passes.ttir.add_bubble_up_operation(pm)
-    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
     pm.run(module)
     print(f"[dump_linalg] ④ bubble_up+structure(r2): verify={module.verify()}", flush=True)
 
@@ -691,7 +541,7 @@ def dump_linalg(path=None, is_causal=False):
     try:
         pm = ir.pass_manager(context)
         pm.enable_debug()
-        ascend.passes.ttir.add_triton_to_linalg_incubated(pm, False, True, False, False, False)
+        ascend.passes.ttir.add_triton_to_linalg(pm, False, True, False, False, False)
         pm.run(module)
         print(f"[dump_linalg] ⑤ triton_to_linalg_incubated: verify={module.verify()}", flush=True)
     except RuntimeError:
@@ -706,21 +556,20 @@ def dump_linalg(path=None, is_causal=False):
     #     copy target has an explicit memory space (e.g. cbuf), the staging
     #     is redundant.  This pass merges the two copies into one direct
     #     GBM -> on-chip transfer, eliminating an alloc + copy + annotation.
-    pm = ir.pass_manager(context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_fold_staging_copy(pm)
-    pm.run(module)
-    print(f"[dump_linalg] ⑤c fold_staging_copy: verify={module.verify()}", flush=True)
+    # pm = ir.pass_manager(context); pm.enable_debug()
+    # ascend.passes.ttir.add_fold_staging_copy(pm)
+    # pm.run(module)
+    # print(f"[dump_linalg] ⑤c fold_staging_copy: verify={module.verify()}", flush=True)
 
     # ── ⑤b Run erase-linalg-casts one more time to reconcile any
     #     unrealized_conversion_cast ops that the partial linalg conversion
     #     may have introduced around the on-chip allocations / function
     #     boundary.
-    pm = ir.pass_manager(context)
-    pm.enable_debug()
-    ascend.passes.ttir.add_erase_linalg_casts(pm)
-    pm.run(module)
-    print(f"[dump_linalg] ⑤b erase_linalg_casts (post): verify={module.verify()}", flush=True)
+    # pm = ir.pass_manager(context)
+    # pm.enable_debug()
+    # ascend.passes.ttir.add_erase_linalg_casts(pm)
+    # pm.run(module)
+    # print(f"[dump_linalg] ⑤b erase_linalg_casts (post): verify={module.verify()}", flush=True)
 
     # ── ⑥ Final canonicalize → erase dead casts ─────────────────────────
     pm = ir.pass_manager(context)
@@ -744,64 +593,62 @@ def dump_linalg(path=None, is_causal=False):
 
 # def gen_bin():
 
-
 # =============================================================================
 #  Host launcher
 # =============================================================================
-def flash_attention_fwd(q, k, v, is_causal=False):
-    B, Hq, S, D = q.shape
-    Hkv = k.shape[1]
-    assert D == DIM and S % BLOCK_N == 0 and Hq % Hkv == 0
-    num_seq_blocks = S // BLOCK_M
-    block_num = num_seq_blocks * Hq * B
-    num_kv_blocks = S // BLOCK_N  # KV blocks per output tile (CB=1: one per task)
 
-    block_num_per_core = block_num // NUM_CORES
-    rem_block_num = block_num % NUM_CORES
 
-    out = torch.empty_like(q)
-    # Single-slot transient workspaces (accumulators are local registers in the kernel)
-    workspace_s = torch.empty((NUM_CORES, BLOCK_M, BLOCK_N), dtype=torch.float16, device=q.device)
-    workspace_p = torch.empty((NUM_CORES, BLOCK_M, BLOCK_N), dtype=q.dtype, device=q.device)
-    workspace_pv = torch.empty((NUM_CORES, BLOCK_M, DIM), dtype=torch.float16, device=q.device)
-    sm_scale = (1.0 / D)**0.5
+class _attention(torch.autograd.Function):
 
-    grid = (NUM_CORES, )
-    flash_attention_fwd_3task_kernel[grid](
-        q,
-        k,
-        v,
-        out,
-        workspace_s,
-        workspace_p,
-        workspace_pv,
-        sm_scale,
-        B,
-        Hq,
-        Hkv,
-        S,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        out.stride(0),
-        out.stride(1),
-        out.stride(2),
-        out.stride(3),
-        block_num_per_core,
-        rem_block_num,
-        NUM_KV_BLOCKS=num_kv_blocks,
-        IS_CAUSAL=is_causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        DIM=DIM,
-        debug=True,
-    )
-    return out
+    @staticmethod
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False):
+        HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
+        HEAD_DIM_V = v.shape[-1]
+        assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
+        o = torch.empty_like(q)
+        stage = 3 if causal else 1
+        M = torch.empty((q.shape[0], q.shape[1], q.shape[2]), device=q.device, dtype=torch.float32)
+
+        def grid(META):
+            return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
+
+        ctx.grid = grid
+        _attn_fwd[grid](
+            q, k, v, sm_scale, M, o,  #
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),  #
+            q.shape[0], q.shape[1], q.shape[2],  #
+            HEAD_DIM=HEAD_DIM_K,  #
+            STAGE=stage,  #
+            custom_pipeline=pipeline,
+            debug=True,
+        )
+
+        ctx.save_for_backward(q, k, v, o, M)
+        ctx.sm_scale = sm_scale
+        ctx.HEAD_DIM = HEAD_DIM_K
+        ctx.causal = causal
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        # backward not needed for native_fa; raise to surface if accidentally called
+        raise NotImplementedError("native_fa does not implement the backward pass")
+
+
+attention = _attention.apply
+
+
+def flash_attention_fwd(q, k, v, combine_batch=None, is_causal=False):
+    """Host launcher: wraps the Flash Attention v2 forward kernel.
+
+    `combine_batch` is accepted for CLI compatibility but unused — the FA v2
+    kernel does not tile over KV blocks in a combine-batch fashion.
+    """
+    sm_scale = q.shape[-1]**-0.5
+    return attention(q, k, v, is_causal, sm_scale, False)
 
 
 if __name__ == "__main__":
@@ -814,8 +661,10 @@ if __name__ == "__main__":
     parser.add_argument("--D", type=int, default=DIM)
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--no-check", action="store_true")
-    parser.add_argument("--dump-mlir", nargs="?", const="", default=None,
-                        help="Dump intermediate TileIR to PATH and exit; no device needed.")
+    parser.add_argument("--combine-batch", type=int, default=8, help="KV blocks per task (arch22 nRatio)")
+    parser.add_argument(
+        "--dump-mlir", nargs="?", const="", default=None,
+        help="Dump intermediate TileIR to PATH (default skill/op/fa_triton_arch.mlir) and exit; no device needed.")
     parser.add_argument("--dump-ir", nargs="?", const="", default=None,
                         help="Dump HIVM IR (after TileIR→HIVM lowering) to PATH and exit; no device needed.")
     parser.add_argument(
@@ -824,19 +673,20 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     B, S, H, D = args.B, args.S, args.H, args.D
+    combine_batch = args.combine_batch
     # ---- dump intermediate TileIR and exit (no device required) ----
     if args.dump_mlir is not None:
-        dump_tileir(path=(args.dump_mlir or None), is_causal=args.causal)
+        dump_tileir(path=(args.dump_mlir or None), combine_batch=combine_batch, is_causal=args.causal)
         raise SystemExit(0)
 
     # ---- dump HIVM IR after full lowering pipeline (no device required) ----
     if args.dump_ir is not None:
-        dump_hivm(path=(args.dump_ir or None), is_causal=args.causal)
+        dump_hivm(path=(args.dump_ir or None), combine_batch=combine_batch, is_causal=args.causal)
         raise SystemExit(0)
 
     # ---- dump Linalg IR after full TileIR→Linalg lowering (no device required) ----
     if args.dump_linalg is not None:
-        dump_linalg(path=(args.dump_linalg or None), is_causal=args.causal)
+        dump_linalg(path=(args.dump_linalg or None), combine_batch=combine_batch, is_causal=args.causal)
         raise SystemExit(0)
 
     Q_H = args.q_heads or H
@@ -848,7 +698,7 @@ if __name__ == "__main__":
     k = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
     v = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
 
-    out = flash_attention_fwd(q, k, v, is_causal=args.causal)
+    out = flash_attention_fwd(q, k, v, combine_batch, is_causal=args.causal)
 
     if not args.no_check:
 

@@ -620,6 +620,7 @@ class _attention(torch.autograd.Function):
             q.shape[0], q.shape[1], q.shape[2],  #
             HEAD_DIM=HEAD_DIM_K,  #
             STAGE=stage,  #
+            debug=True,
         )
 
         ctx.save_for_backward(q, k, v, o, M)

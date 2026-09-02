@@ -110,7 +110,7 @@ def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES):
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
     matmul_add_residual_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, m, n, k, num_cores, BLOCK_M=BLOCK_M,
-                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K)
+                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, debug=True)
     return mat_c
 
 

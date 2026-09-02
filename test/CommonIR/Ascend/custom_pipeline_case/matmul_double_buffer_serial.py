@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+pipeline = "hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1"
+
 import triton.experimental.tle as tle  # noqa: F401  (registers tile/tle dialects)
 from triton.experimental.tle.language.dsa.ascend import L1  # noqa: F401
 from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor, tile_subview  # noqa: F401
@@ -124,7 +126,7 @@ def call(mat_a, mat_b, num_cores=_DEFAULT_NUM_CORES):
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
     matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K, debug=True)
+                                 BLOCK_K=BLOCK_K, custom_pipeline=pipeline, debug=True)
     return mat_c
 
 

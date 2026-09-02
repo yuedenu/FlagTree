@@ -5,6 +5,8 @@ import torch
 import triton
 import triton.language as tl
 
+pipeline = "hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1"
+
 import triton.experimental.tle as tle
 
 # =============================================================================
@@ -34,6 +36,11 @@ def get_number_cores():
 #
 #  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
 #  blocks in round-robin fashion, iterating over K dimension.
+#
+#  The 2x L1 buffers are used in a ping-pong / alternating fashion: even K
+#  iterations use slot 0, odd iterations use slot 1.  Both halves are read
+#  and written on every two iterations, so the compiler cannot eliminate
+#  either slot or shrink the allocation.
 # =============================================================================
 @triton.jit
 def matmul_kernel(
@@ -54,9 +61,15 @@ def matmul_kernel(
     NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
     NUM_K_BLOCKS = tl.cdiv(K, BLOCK_K)
 
-    # On-chip buffers: A/B in L1.
-    mat_a_l1 = tle.dsa.alloc([BLOCK_M, BLOCK_K], dtype=mat_a.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
-    mat_b_l1 = tle.dsa.alloc([BLOCK_K, BLOCK_N], dtype=mat_b.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
+    # On-chip buffers: allocate 2x size in L1 to exercise insert_slice/extract_slice.
+    # mat_a_l1 holds [2*BLOCK_M, BLOCK_K]:
+    #   slot 0 → rows [0      : BLOCK_M  ]  (even K iterations)
+    #   slot 1 → rows [BLOCK_M : 2*BLOCK_M] (odd  K iterations)
+    # mat_b_l1 holds [BLOCK_K, 2*BLOCK_N]:
+    #   slot 0 → cols [0      : BLOCK_N  ]  (even K iterations)
+    #   slot 1 → cols [BLOCK_N : 2*BLOCK_N] (odd  K iterations)
+    mat_a_l1 = tle.dsa.alloc([2 * BLOCK_M, BLOCK_K], dtype=mat_a.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
+    mat_b_l1 = tle.dsa.alloc([BLOCK_K, 2 * BLOCK_N], dtype=mat_b.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
 
     # Each core processes output blocks in round-robin
     for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
@@ -71,16 +84,38 @@ def matmul_kernel(
         b_block_ptr = tl.make_block_ptr(mat_b, (K, N), (N, 1), (0, n_start), (BLOCK_K, BLOCK_N), (1, 0))
 
         mat_c_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        # K-loop: load A/B tiles from GM to L1, then dot
+        # K-loop: ping-pong between slot 0 and slot 1 of each 2x L1 buffer.
+        #
+        # k_idx % 2 == 0  →  A slot: row-offset 0,       B slot: col-offset 0
+        # k_idx % 2 == 1  →  A slot: row-offset BLOCK_M,  B slot: col-offset BLOCK_N
+        #
+        # Because both slots are written and read on alternating iterations the
+        # compiler cannot prove either half is dead and must keep the full 2x
+        # allocation live.
         for k_idx in range(0, NUM_K_BLOCKS):
-            # Copy A tile
-            tle.dsa.copy(a_block_ptr, mat_a_l1, [BLOCK_M, BLOCK_K])
-            # Copy B tile
-            tle.dsa.copy(b_block_ptr, mat_b_l1, [BLOCK_K, BLOCK_N])
+            # Compute the row / col offset for this iteration's slot.
+            # tl.where on constexpr-shaped scalars gives a runtime-varying
+            # but type-stable offset that prevents constant folding.
+            a_row_off = tl.where(k_idx % 2 == 0, 0, BLOCK_M)
+            b_col_off = tl.where(k_idx % 2 == 0, 0, BLOCK_N)
+
+            # ── A: insert the incoming GM tile into the active slot, then
+            #    extract it back out for use in tl.dot.
+            a_l1_full = tle.dsa.to_tensor(mat_a_l1, writable=True)
+            a_l1_updated = tle.dsa.insert_slice(a_l1_full, tl.load(a_block_ptr), offsets=[a_row_off, 0],
+                                                sizes=[BLOCK_M, BLOCK_K], strides=[1, 1])
+            a_tile = tle.dsa.extract_slice(a_l1_updated, offsets=[a_row_off, 0], sizes=[BLOCK_M, BLOCK_K],
+                                           strides=[1, 1])
+
+            # ── B: same ping-pong pattern for the [BLOCK_K, 2*BLOCK_N] buffer.
+            b_l1_full = tle.dsa.to_tensor(mat_b_l1, writable=True)
+            b_l1_updated = tle.dsa.insert_slice(b_l1_full, tl.load(b_block_ptr), offsets=[0, b_col_off],
+                                                sizes=[BLOCK_K, BLOCK_N], strides=[1, 1])
+            b_tile = tle.dsa.extract_slice(b_l1_updated, offsets=[0, b_col_off], sizes=[BLOCK_K, BLOCK_N],
+                                           strides=[1, 1])
 
             # Accumulate: C += A @ B
-            mat_c_acc = tl.dot(tle.dsa.to_tensor(mat_a_l1, writable=False), tle.dsa.to_tensor(mat_b_l1, writable=False),
-                               mat_c_acc, out_dtype=tl.float32)
+            mat_c_acc = tl.dot(a_tile, b_tile, mat_c_acc, out_dtype=tl.float32)
 
             # Advance block pointers along K
             a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_K])
@@ -101,7 +136,7 @@ def call(mat_a, mat_b):
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
     num_cores = get_number_cores()
     matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K, debug=True)
+                                 BLOCK_K=BLOCK_K, custom_pipeline=pipeline, debug=True)
     return mat_c
 
 
@@ -251,8 +286,8 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 
     # ── ② Structured (r1) + discrete mask ────────────────────────────────
     pm = ir.pass_manager(context)
-    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
-    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False, False)
+    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False)
     pm.run(module)
     print(f"[dump_linalg] ② structure(r1)+discrete_mask: verify={module.verify()}", flush=True)
 
@@ -268,7 +303,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     # ── ④ Bubble-up + structured (r2) ────────────────────────────────────
     pm = ir.pass_manager(context)
     ascend.passes.ttir.add_bubble_up_operation(pm)
-    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
     pm.run(module)
     print(f"[dump_linalg] ④ bubble_up+structure(r2): verify={module.verify()}", flush=True)
 
@@ -282,7 +317,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     # ── ⑤ Triton → Linalg ───────────────────────────────────────────────
     try:
         pm = ir.pass_manager(context)
-        ascend.passes.ttir.add_triton_to_linalg(pm, False, True, False, False, False)
+        ascend.passes.ttir.add_triton_to_linalg_incubated(pm, False, True, False, False, False)
         pm.run(module)
         print(f"[dump_linalg] ⑤ triton_to_linalg_incubated: verify={module.verify()}", flush=True)
     except RuntimeError as e:

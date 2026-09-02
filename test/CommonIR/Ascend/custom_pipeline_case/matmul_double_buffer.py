@@ -5,10 +5,31 @@ import torch
 import triton
 import triton.language as tl
 
-import triton.experimental.tle as tle
+pipeline = "hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1"
+
+import triton.experimental.tle as tle  # noqa: F401  (registers tile/tle dialects)
+from triton.experimental.tle.language.dsa.ascend import L1  # noqa: F401
+from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor, tile_subview  # noqa: F401
 
 # =============================================================================
 #  Compile-time configuration
+#
+#  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
+#  blocks in round-robin fashion.
+#
+#  Strategy: "copy-first" (prefetch-first) ordering -- tile_copy prefetches
+#  the NEXT K-tile into buf1, then a barrier ensures the DMA completes,
+#  then tl.dot computes from buf0 (which holds the CURRENT K-tile).
+#
+#  Loop body (unrolled x2):
+#    Even step: copy(next -> buf1), barrier, dot(buf0)
+#    Odd step:  copy(next -> buf0), barrier, dot(buf1)
+#
+#  NOTE: tileir_to_hivm merges tile.alloc of identical shape/dtype into a
+#  single physical cbuf allocation. This causes buf0 and buf1 to share the
+#  same memref, breaking the double-buffer semantics. The copy overwrites the
+#  data that dot intends to read. This kernel produces WRONG results under
+#  the current compiler -- it is kept for reference / future compiler fixes.
 # =============================================================================
 _DEFAULT_M = 1024
 _DEFAULT_N = 1024
@@ -30,10 +51,7 @@ def get_number_cores():
 
 
 # =============================================================================
-#  Simple matmul kernel: single loop with tle.dsa.copy + tl.dot
-#
-#  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
-#  blocks in round-robin fashion, iterating over K dimension.
+#  Matmul kernel: copy-first double buffer
 # =============================================================================
 @triton.jit
 def matmul_kernel(
@@ -54,37 +72,55 @@ def matmul_kernel(
     NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
     NUM_K_BLOCKS = tl.cdiv(K, BLOCK_K)
 
-    # On-chip buffers: A/B in L1.
-    mat_a_l1 = tle.dsa.alloc([BLOCK_M, BLOCK_K], dtype=mat_a.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
-    mat_b_l1 = tle.dsa.alloc([BLOCK_K, BLOCK_N], dtype=mat_b.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
+    # On-chip double buffers in L1
+    mat_a_l1_0 = tile_alloc([BLOCK_M, BLOCK_K], mat_a.dtype.element_ty, tle.language.dsa.ascend.L1)
+    mat_a_l1_1 = tile_alloc([BLOCK_M, BLOCK_K], mat_a.dtype.element_ty, tle.language.dsa.ascend.L1)
+    mat_b_l1_0 = tile_alloc([BLOCK_K, BLOCK_N], mat_b.dtype.element_ty, tle.language.dsa.ascend.L1)
+    mat_b_l1_1 = tile_alloc([BLOCK_K, BLOCK_N], mat_b.dtype.element_ty, tle.language.dsa.ascend.L1)
 
     # Each core processes output blocks in round-robin
     for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
-        # Compute M/N tile indices
         pid_m = block_idx // NUM_BLOCKS_N
         pid_n = block_idx % NUM_BLOCKS_N
         m_start = pid_m * BLOCK_M
         n_start = pid_n * BLOCK_N
 
-        # Create block pointers for A and B
-        a_block_ptr = tl.make_block_ptr(mat_a, (M, K), (K, 1), (m_start, 0), (BLOCK_M, BLOCK_K), (1, 0))
-        b_block_ptr = tl.make_block_ptr(mat_b, (K, N), (N, 1), (0, n_start), (BLOCK_K, BLOCK_N), (1, 0))
-
         mat_c_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        # K-loop: load A/B tiles from GM to L1, then dot
-        for k_idx in range(0, NUM_K_BLOCKS):
-            # Copy A tile
-            tle.dsa.copy(a_block_ptr, mat_a_l1, [BLOCK_M, BLOCK_K])
-            # Copy B tile
-            tle.dsa.copy(b_block_ptr, mat_b_l1, [BLOCK_K, BLOCK_N])
 
-            # Accumulate: C += A @ B
-            mat_c_acc = tl.dot(tle.dsa.to_tensor(mat_a_l1, writable=False), tle.dsa.to_tensor(mat_b_l1, writable=False),
+        # -- Prologue: load first K-tile into buffer 0 ---------------------
+        a_ptr = tl.make_block_ptr(mat_a, (M, K), (K, 1), (m_start, 0), (BLOCK_M, BLOCK_K), (1, 0))
+        b_ptr = tl.make_block_ptr(mat_b, (K, N), (N, 1), (0, n_start), (BLOCK_K, BLOCK_N), (1, 0))
+        tile_copy(a_ptr, mat_a_l1_0, [BLOCK_M, BLOCK_K])
+        tile_copy(b_ptr, mat_b_l1_0, [BLOCK_K, BLOCK_N])
+
+        # -- Main K-loop: copy-first, double-buffered -----------------------
+        for k_pair in range(0, NUM_K_BLOCKS - 1, 2):
+            # Even: prefetch k+1 -> buf1, wait DMA, compute buf0, wait compute
+            a_ptr = tl.advance(a_ptr, [0, BLOCK_K])
+            b_ptr = tl.advance(b_ptr, [BLOCK_K, 0])
+            tile_copy(a_ptr, mat_a_l1_1, [BLOCK_M, BLOCK_K])
+            tile_copy(b_ptr, mat_b_l1_1, [BLOCK_K, BLOCK_N])
+            tl.debug_barrier()  # wait: buf1 DMA done
+            mat_c_acc = tl.dot(tile_to_tensor(mat_a_l1_0, writable=False), tile_to_tensor(mat_b_l1_0, writable=False),
                                mat_c_acc, out_dtype=tl.float32)
+            tl.debug_barrier()  # wait: dot(buf0) done before overwriting buf0
 
-            # Advance block pointers along K
-            a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_K])
-            b_block_ptr = tl.advance(b_block_ptr, [BLOCK_K, 0])
+            # Odd: prefetch k+2 -> buf0, wait DMA, compute buf1, wait compute
+            if k_pair + 2 < NUM_K_BLOCKS:
+                a_ptr = tl.advance(a_ptr, [0, BLOCK_K])
+                b_ptr = tl.advance(b_ptr, [BLOCK_K, 0])
+                tile_copy(a_ptr, mat_a_l1_0, [BLOCK_M, BLOCK_K])
+                tile_copy(b_ptr, mat_b_l1_0, [BLOCK_K, BLOCK_N])
+            tl.debug_barrier()  # wait: buf0 DMA done (or nop if no copy)
+            mat_c_acc = tl.dot(tile_to_tensor(mat_a_l1_1, writable=False), tile_to_tensor(mat_b_l1_1, writable=False),
+                               mat_c_acc, out_dtype=tl.float32)
+            tl.debug_barrier()  # wait: dot(buf1) done before overwriting buf1 next iteration
+
+        # -- Epilogue: consume the last tile if NUM_K_BLOCKS is odd ---------
+        if NUM_K_BLOCKS % 2 == 1:
+            tl.debug_barrier()
+            mat_c_acc = tl.dot(tile_to_tensor(mat_a_l1_0, writable=False), tile_to_tensor(mat_b_l1_0, writable=False),
+                               mat_c_acc, out_dtype=tl.float32)
 
         # Store result back to GM
         tl.store(tl.make_block_ptr(mat_c, (M, N), (N, 1), (m_start, n_start), (BLOCK_M, BLOCK_N), (1, 0)),
@@ -94,19 +130,18 @@ def matmul_kernel(
 # =============================================================================
 #  Host-side launch
 # =============================================================================
-def call(mat_a, mat_b):
+def call(mat_a, mat_b, num_cores=_DEFAULT_NUM_CORES):
     m = mat_a.shape[0]
     k = mat_a.shape[1]
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
-    num_cores = get_number_cores()
     matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K, debug=True)
+                                 BLOCK_K=BLOCK_K, custom_pipeline=pipeline, debug=True)
     return mat_c
 
 
 # =============================================================================
-#  Intermediate TTIR dump (no device required)
+#  Intermediate IR dump helpers (no device required)
 # =============================================================================
 class _DumpOptions:
     num_warps = 4
@@ -122,7 +157,7 @@ class _DumpOptions:
 
 
 def _matmul_signature():
-    """Static signature for ast_to_ttir — non-constexpr args only."""
+    """Static signature for ast_to_ttir -- non-constexpr args only."""
     return {
         "mat_a": "*fp16",
         "mat_b": "*fp16",
@@ -173,7 +208,7 @@ def _compile_matmul_module(M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
     """Compile matmul_kernel to TTIR and write to *path*."""
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_ttir.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_double_buffer_ttir.mlir")
 
     module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
     mlir = str(module)
@@ -190,7 +225,7 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
 def dump_tileir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
     """Dump the frontend TileIR stage before TileIR-to-HIVM lowering."""
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_tileir.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_double_buffer_tileir.mlir")
 
     module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
     mlir = str(module)
@@ -208,105 +243,105 @@ def dump_tileir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 
 
 # =============================================================================
-#  Full Linalg IR dump (TTIR → TileIR → Linalg lowering)
+#  Full Linalg IR dump (TTIR -> TileIR -> Linalg lowering)
 # =============================================================================
 def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_kernel through full TileIR → Linalg lowering pipeline.
+    """Compile matmul_kernel through full TileIR -> Linalg lowering pipeline.
 
     Pipeline:
-      ① tileir_to_hivm            — tile.* → memref/hivm
-      ①b erase_linalg_casts       — eliminate unrealized casts
-      ② structure(r1) + discrete mask
-      ③ unstructure + hivm + hfusion + llvm
-      ④ bubble_up + structure(r2)
-      ④b inline + canonicalize
-      ⑤ triton_to_linalg_incubated
-      ⑤b erase_linalg_casts (post)
-      ⑥ final canonicalize + CSE + DCE
+      (1) tileir_to_hivm            -- tile.* -> memref/hivm
+      (1b) erase_linalg_casts       -- eliminate unrealized casts
+      (2) structure(r1) + discrete mask
+      (3) unstructure + hivm + hfusion + llvm
+      (4) bubble_up + structure(r2)
+      (4b) inline + canonicalize
+      (5) triton_to_linalg_incubated
+      (5c) fold_staging_copy
+      (5b) erase_linalg_casts (post)
+      (6) final canonicalize + CSE + DCE
 
     Returns the final Linalg MLIR string.
     """
     from triton._C.libtriton import ir, passes, ascend
 
-    # Step 1: compile to TTIR — get module directly (avoids reparse/dialect issues)
     module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
     context = module.context
 
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_linalg.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_double_buffer_linalg.mlir")
 
-    # ── ① TileIR → HIVM ──────────────────────────────────────────────────
+    # -- (1) TileIR -> HIVM -----------------------------------------------
     pm = ir.pass_manager(context)
     passes.common.add_inliner(pm)
     ascend.passes.ttir.add_tileir_to_hivm(pm)
     pm.run(module)
-    print(f"[dump_linalg] ① tileir_to_hivm: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] (1) tileir_to_hivm: verify={module.verify()}", flush=True)
 
-    # ── ①b Erase unrealized_conversion_cast ops ──────────────────────────
+    # -- (1b) Erase unrealized_conversion_cast ops ------------------------
     # pm = ir.pass_manager(context)
     # ascend.passes.ttir.add_erase_linalg_casts(pm)
     # passes.common.add_canonicalizer(pm)
     # pm.run(module)
-    # print(f"[dump_linalg] ①b erase_linalg_casts: verify={module.verify()}", flush=True)
+    # print(f"[dump_linalg] (1b) erase_linalg_casts: verify={module.verify()}", flush=True)
 
-    # ── ② Structured (r1) + discrete mask ────────────────────────────────
+    # -- (2) Structured (r1) + discrete mask ------------------------------
     pm = ir.pass_manager(context)
     # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
     ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False, False)
     pm.run(module)
-    print(f"[dump_linalg] ② structure(r1)+discrete_mask: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] (2) structure(r1)+discrete_mask: verify={module.verify()}", flush=True)
 
-    # ── ③ Unstructured + HIVM + HFusion + LLVM ──────────────────────────
+    # -- (3) Unstructured + HIVM + HFusion + LLVM -------------------------
     pm = ir.pass_manager(context)
-    ascend.passes.ttir.add_triton_to_unstructure_incubated(pm, False, False)
+    ascend.passes.ttir.add_triton_to_unstructure(pm, False, False)
     ascend.passes.ttir.add_triton_to_hivm(pm)
     ascend.passes.ttir.add_triton_to_hfusion(pm)
     ascend.passes.ttir.add_triton_to_llvm(pm)
     pm.run(module)
-    print(f"[dump_linalg] ③ unstructure+hivm+hfusion+llvm: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] (3) unstructure+hivm+hfusion+llvm: verify={module.verify()}", flush=True)
 
-    # ── ④ Bubble-up + structured (r2) ────────────────────────────────────
+    # -- (4) Bubble-up + structured (r2) ----------------------------------
     pm = ir.pass_manager(context)
     ascend.passes.ttir.add_bubble_up_operation(pm)
     # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
     pm.run(module)
-    print(f"[dump_linalg] ④ bubble_up+structure(r2): verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] (4) bubble_up+structure(r2): verify={module.verify()}", flush=True)
 
-    # ── ④b Inline + canonicalize ─────────────────────────────────────────
+    # -- (4b) Inline + canonicalize ---------------------------------------
     pm = ir.pass_manager(context)
     passes.common.add_inliner(pm)
     passes.common.add_canonicalizer(pm)
     pm.run(module)
-    print(f"[dump_linalg] ④b inline+canonicalize: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] (4b) inline+canonicalize: verify={module.verify()}", flush=True)
 
-    # ── ⑤ Triton → Linalg ───────────────────────────────────────────────
+    # -- (5) Triton -> Linalg ---------------------------------------------
     try:
         pm = ir.pass_manager(context)
         ascend.passes.ttir.add_triton_to_linalg(pm, False, True, False, False, False)
         pm.run(module)
-        print(f"[dump_linalg] ⑤ triton_to_linalg_incubated: verify={module.verify()}", flush=True)
+        print(f"[dump_linalg] (5) triton_to_linalg_incubated: verify={module.verify()}", flush=True)
     except RuntimeError as e:
-        print(f"[dump_linalg] ⑤ triton_to_linalg_incubated: partial ({e})", flush=True)
+        print(f"[dump_linalg] (5) triton_to_linalg_incubated: partial ({e})", flush=True)
 
-    # ── ⑤c Fold staging copies (eliminate redundant default-space allocs) ─
+    # -- (5c) Fold staging copies -----------------------------------------
     # pm = ir.pass_manager(context)
     # ascend.passes.ttir.add_fold_staging_copy(pm)
     # pm.run(module)
-    # print(f"[dump_linalg] ⑤c fold_staging_copy: verify={module.verify()}", flush=True)
+    # print(f"[dump_linalg] (5c) fold_staging_copy: verify={module.verify()}", flush=True)
 
-    # ── ⑤b Erase linalg casts (post) ────────────────────────────────────
+    # -- (5b) Erase linalg casts (post) -----------------------------------
     # pm = ir.pass_manager(context)
     # ascend.passes.ttir.add_erase_linalg_casts(pm)
     # pm.run(module)
-    # print(f"[dump_linalg] ⑤b erase_linalg_casts (post): verify={module.verify()}", flush=True)
+    # print(f"[dump_linalg] (5b) erase_linalg_casts (post): verify={module.verify()}", flush=True)
 
-    # ── ⑥ Final canonicalize + CSE + DCE ─────────────────────────────────
-    # pm = ir.pass_manager(context)
-    # passes.common.add_canonicalizer(pm)
-    # passes.common.add_cse(pm)
-    # passes.common.add_symbol_dce(pm)
-    # pm.run(module)
-    # print(f"[dump_linalg] ⑥ final cleanup: verify={module.verify()}", flush=True)
+    # -- (6) Final canonicalize + CSE + DCE -------------------------------
+    pm = ir.pass_manager(context)
+    passes.common.add_canonicalizer(pm)
+    passes.common.add_cse(pm)
+    passes.common.add_symbol_dce(pm)
+    pm.run(module)
+    print(f"[dump_linalg] (6) final cleanup: verify={module.verify()}", flush=True)
 
     ok = module.verify()
     if not ok:
@@ -323,7 +358,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 #  CLI entry point
 # =============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Matmul kernel (tle.dsa.alloc/copy/to_tensor + tl.dot)")
+    parser = argparse.ArgumentParser(description="Matmul kernel (copy-first double buffer)")
     parser.add_argument("--M", type=int, default=_DEFAULT_M)
     parser.add_argument("--N", type=int, default=_DEFAULT_N)
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
@@ -358,7 +393,7 @@ if __name__ == "__main__":
     mat_a = torch.randn((M, K), dtype=torch.float16, device=device)
     mat_b = torch.randn((K, N), dtype=torch.float16, device=device)
 
-    mat_c = call(mat_a, mat_b)
+    mat_c = call(mat_a, mat_b, num_cores)
 
     if not args.no_check:
         ref = torch.matmul(mat_a.float(), mat_b.float()).to(torch.float16)
