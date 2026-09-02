@@ -599,7 +599,7 @@ def dump_linalg(path=None, combine_batch=32, is_causal=False):
 class _attention(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False):
+    def forward(ctx, q, k, v, causal, sm_scale, warp_specialize=False, debug_compile=False):
         HEAD_DIM_Q, HEAD_DIM_K = q.shape[-1], k.shape[-1]
         HEAD_DIM_V = v.shape[-1]
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
@@ -611,6 +611,9 @@ class _attention(torch.autograd.Function):
             return (triton.cdiv(q.shape[2], META["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
 
         ctx.grid = grid
+        compile_options = {}
+        if debug_compile:
+            compile_options["debug"] = True
         _attn_fwd[grid](
             q, k, v, sm_scale, M, o,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
@@ -638,14 +641,14 @@ class _attention(torch.autograd.Function):
 attention = _attention.apply
 
 
-def flash_attention_fwd(q, k, v, combine_batch=None, is_causal=False):
+def flash_attention_fwd(q, k, v, combine_batch=None, is_causal=False, debug_compile=False):
     """Host launcher: wraps the Flash Attention v2 forward kernel.
 
     `combine_batch` is accepted for CLI compatibility but unused — the FA v2
     kernel does not tile over KV blocks in a combine-batch fashion.
     """
     sm_scale = q.shape[-1]**-0.5
-    return attention(q, k, v, is_causal, sm_scale, False)
+    return attention(q, k, v, is_causal, sm_scale, False, debug_compile)
 
 
 if __name__ == "__main__":
@@ -659,6 +662,11 @@ if __name__ == "__main__":
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--no-check", action="store_true")
     parser.add_argument("--combine-batch", type=int, default=8, help="KV blocks per task (arch22 nRatio)")
+    parser.add_argument(
+        "--debug-compile",
+        action="store_true",
+        help="Print the backend compiler command.",
+    )
     parser.add_argument(
         "--dump-mlir", nargs="?", const="", default=None,
         help="Dump intermediate TileIR to PATH (default skill/op/fa_triton_arch.mlir) and exit; no device needed.")
@@ -695,7 +703,14 @@ if __name__ == "__main__":
     k = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
     v = torch.randn((B, KV_H, S, D), dtype=torch.float16, device=device)
 
-    out = flash_attention_fwd(q, k, v, combine_batch, is_causal=args.causal)
+    out = flash_attention_fwd(
+        q,
+        k,
+        v,
+        combine_batch,
+        is_causal=args.causal,
+        debug_compile=args.debug_compile,
+    )
 
     if not args.no_check:
 
