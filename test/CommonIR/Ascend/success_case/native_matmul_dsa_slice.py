@@ -134,7 +134,7 @@ def call(mat_a, mat_b):
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
     num_cores = get_number_cores()
     matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K)
+                                 BLOCK_K=BLOCK_K, debug=True)
     return mat_c
 
 

@@ -802,7 +802,7 @@ def flash_attention_fwd(q, k, v, is_causal=False, debug_compile=False):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         DIM=DIM,
-        custom_pipeline="",
+        custom_pipeline="hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1",
         **compile_options,
     )
     return out

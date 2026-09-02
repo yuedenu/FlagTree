@@ -32,16 +32,19 @@ def get_number_cores():
 
 
 # =============================================================================
-#  Simple matmul kernel: single loop with tile_copy + tl.dot
+#  Matmul + residual kernel: C = A @ B + residual
 #
 #  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
 #  blocks in round-robin fashion, iterating over K dimension.
+#  residual is a 2-D tensor of shape [M, N]; added element-wise after the
+#  K-loop accumulation.
 # =============================================================================
 @triton.jit
-def matmul_kernel(
+def matmul_add_residual_kernel(
     mat_a,
     mat_b,
     mat_c,
+    residual,
     M,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -88,6 +91,11 @@ def matmul_kernel(
             a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_K])
             b_block_ptr = tl.advance(b_block_ptr, [BLOCK_K, 0])
 
+        # Load residual tile [BLOCK_M, BLOCK_N] and add element-wise
+        residual_tile = tl.load(
+            tl.make_block_ptr(residual, (M, N), (N, 1), (m_start, n_start), (BLOCK_M, BLOCK_N), (1, 0)))
+        mat_c_acc += residual_tile.to(tl.float32)
+
         # Store result back to GM
         tl.store(tl.make_block_ptr(mat_c, (M, N), (N, 1), (m_start, n_start), (BLOCK_M, BLOCK_N), (1, 0)),
                  mat_c_acc.to(mat_c.dtype.element_ty))
@@ -96,13 +104,16 @@ def matmul_kernel(
 # =============================================================================
 #  Host-side launch
 # =============================================================================
-def call(mat_a, mat_b, num_cores=_DEFAULT_NUM_CORES):
+def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES, debug_compile=False):
     m = mat_a.shape[0]
     k = mat_a.shape[1]
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
-    matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K)
+    compile_options = {}
+    if debug_compile:
+        compile_options["debug"] = True
+    matmul_add_residual_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, m, n, k, num_cores, BLOCK_M=BLOCK_M,
+                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, **compile_options)
     return mat_c
 
 
@@ -122,18 +133,19 @@ class _DumpOptions:
     sanitize_overflow = False
 
 
-def _matmul_signature():
+def _matmul_add_residual_signature():
     """Static signature for ast_to_ttir — non-constexpr args only."""
     return {
         "mat_a": "*fp16",
         "mat_b": "*fp16",
         "mat_c": "*fp16",
+        "residual": "*fp16",
         "M": "i32",
     }
 
 
 def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
-    """Compile matmul_kernel to TTIR and write to *path*."""
+    """Compile matmul_add_residual_kernel to TTIR and write to *path*."""
     from triton.compiler.compiler import ASTSource
     from triton.compiler.code_generator import ast_to_ttir
     from triton._C.libtriton import ir
@@ -142,9 +154,9 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
     os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
 
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_triton.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_triton.mlir")
 
-    signature = _matmul_signature()
+    signature = _matmul_add_residual_signature()
     constants = {
         "N": N,
         "K": K,
@@ -154,7 +166,7 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
         "BLOCK_K": BLOCK_K,
     }
 
-    src = ASTSource(matmul_kernel.fn, signature, constants)
+    src = ASTSource(matmul_add_residual_kernel.fn, signature, constants)
     context = ir.context()
     ir.load_dialects(context)
     tle_ir.load_dialects(context)
@@ -166,7 +178,7 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
         pass
 
     codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
-    module = ast_to_ttir(matmul_kernel, src, context, _DumpOptions(), codegen_fns, {})
+    module = ast_to_ttir(matmul_add_residual_kernel, src, context, _DumpOptions(), codegen_fns, {})
 
     ok = module.verify()
     if not ok:
@@ -187,7 +199,7 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
 #  Full Linalg IR dump (TTIR → TileIR → Linalg lowering)
 # =============================================================================
 def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_kernel through full TileIR → Linalg lowering pipeline.
+    """Compile matmul_add_residual_kernel through full TileIR → Linalg lowering pipeline.
 
     Pipeline:
       ① tileir_to_hivm            — tile.* → memref/hivm
@@ -197,6 +209,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
       ④ bubble_up + structure(r2)
       ④b inline + canonicalize
       ⑤ triton_to_linalg_incubated
+      ⑤c fold_staging_copy
       ⑤b erase_linalg_casts (post)
       ⑥ final canonicalize + CSE + DCE
 
@@ -209,7 +222,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     context = module.context
 
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_triton_linalg.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_triton_linalg.mlir")
 
     # ── ① TileIR → HIVM ──────────────────────────────────────────────────
     pm = ir.pass_manager(context)
@@ -277,12 +290,12 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     # print(f"[dump_linalg] ⑤b erase_linalg_casts (post): verify={module.verify()}", flush=True)
 
     # ── ⑥ Final canonicalize + CSE + DCE ─────────────────────────────────
-    pm = ir.pass_manager(context)
-    passes.common.add_canonicalizer(pm)
-    passes.common.add_cse(pm)
-    passes.common.add_symbol_dce(pm)
-    pm.run(module)
-    print(f"[dump_linalg] ⑥ final cleanup: verify={module.verify()}", flush=True)
+    # pm = ir.pass_manager(context)
+    # passes.common.add_canonicalizer(pm)
+    # passes.common.add_cse(pm)
+    # passes.common.add_symbol_dce(pm)
+    # pm.run(module)
+    # print(f"[dump_linalg] ⑥ final cleanup: verify={module.verify()}", flush=True)
 
     ok = module.verify()
     if not ok:
@@ -299,12 +312,17 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 #  CLI entry point
 # =============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Matmul kernel (simple tile_copy + tl.dot)")
+    parser = argparse.ArgumentParser(description="Matmul + residual kernel (C = A @ B + residual)")
     parser.add_argument("--M", type=int, default=_DEFAULT_M)
     parser.add_argument("--N", type=int, default=_DEFAULT_N)
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
     parser.add_argument("--num-cores", type=int, default=None)
     parser.add_argument("--no-check", action="store_true")
+    parser.add_argument(
+        "--debug-compile",
+        action="store_true",
+        help="Print the backend compiler command.",
+    )
     parser.add_argument("--dump-ttir", nargs="?", const="", default=None,
                         help="Dump TTIR to PATH and exit; no device needed.")
     parser.add_argument("--dump-linalg", nargs="?", const="", default=None,
@@ -327,11 +345,12 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     mat_a = torch.randn((M, K), dtype=torch.float16, device=device)
     mat_b = torch.randn((K, N), dtype=torch.float16, device=device)
+    residual = torch.randn((M, N), dtype=torch.float16, device=device)
 
-    mat_c = call(mat_a, mat_b, num_cores)
+    mat_c = call(mat_a, mat_b, residual, num_cores, debug_compile=args.debug_compile)
 
     if not args.no_check:
-        ref = torch.matmul(mat_a.float(), mat_b.float()).to(torch.float16)
+        ref = (torch.matmul(mat_a.float(), mat_b.float()) + residual.float()).to(torch.float16)
         torch.testing.assert_close(ref, mat_c, rtol=1e-2, atol=1e-2)
         print("Test Passed!")
     else:

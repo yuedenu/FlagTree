@@ -113,8 +113,7 @@ def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES, debug_compile=Fal
     if debug_compile:
         compile_options["debug"] = True
     matmul_add_residual_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, m, n, k, num_cores, BLOCK_M=BLOCK_M,
-                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                                              custom_pipeline="", **compile_options)
+                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, custom_pipeline="hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1",**compile_options)
     return mat_c
 
 
@@ -319,8 +318,11 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
     parser.add_argument("--num-cores", type=int, default=None)
     parser.add_argument("--no-check", action="store_true")
-    parser.add_argument("--debug-compile", action="store_true",
-                        help="Print the backend compiler command and dump intermediate IR.")
+    parser.add_argument(
+        "--debug-compile",
+        action="store_true",
+        help="Print the backend compiler command.",
+    )
     parser.add_argument("--dump-ttir", nargs="?", const="", default=None,
                         help="Dump TTIR to PATH and exit; no device needed.")
     parser.add_argument("--dump-linalg", nargs="?", const="", default=None,

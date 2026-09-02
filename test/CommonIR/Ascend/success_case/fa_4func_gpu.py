@@ -799,6 +799,7 @@ def flash_attention_fwd(q, k, v, is_causal=False):
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         DIM=DIM,
+        debug=True,
     )
     return out
 
