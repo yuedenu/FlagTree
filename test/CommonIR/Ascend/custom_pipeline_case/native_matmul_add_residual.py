@@ -5,9 +5,9 @@ import torch
 import triton
 import triton.language as tl
 
-pipeline = "hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1"
-
-import triton.experimental.tle as tle
+import triton.experimental.tle as tle  # noqa: F401  (registers tile/tle dialects)
+from triton.experimental.tle.language.dsa.ascend import L1, L0C  # noqa: F401
+from triton.experimental.tle.language.dsa import tile_alloc, tile_copy, tile_to_tensor  # noqa: F401
 
 # =============================================================================
 #  Compile-time configuration
@@ -32,21 +32,19 @@ def get_number_cores():
 
 
 # =============================================================================
-#  Simple matmul kernel: single loop with tle.dsa.copy + tl.dot
+#  Matmul + residual kernel: C = A @ B + residual
 #
 #  grid = (NUM_CORES,). Each core handles multiple (M_tile, N_tile) output
 #  blocks in round-robin fashion, iterating over K dimension.
-#
-#  The 2x L1 buffers are used in a ping-pong / alternating fashion: even K
-#  iterations use slot 0, odd iterations use slot 1.  Both halves are read
-#  and written on every two iterations, so the compiler cannot eliminate
-#  either slot or shrink the allocation.
+#  residual is a 2-D tensor of shape [M, N]; added element-wise after the
+#  K-loop accumulation.
 # =============================================================================
 @triton.jit
-def matmul_kernel(
+def matmul_add_residual_kernel(
     mat_a,
     mat_b,
     mat_c,
+    residual,
     M,
     N: tl.constexpr,
     K: tl.constexpr,
@@ -61,15 +59,9 @@ def matmul_kernel(
     NUM_BLOCKS = NUM_BLOCKS_M * NUM_BLOCKS_N
     NUM_K_BLOCKS = tl.cdiv(K, BLOCK_K)
 
-    # On-chip buffers: allocate 2x size in L1 to exercise insert_slice/extract_slice.
-    # mat_a_l1 holds [2*BLOCK_M, BLOCK_K]:
-    #   slot 0 → rows [0      : BLOCK_M  ]  (even K iterations)
-    #   slot 1 → rows [BLOCK_M : 2*BLOCK_M] (odd  K iterations)
-    # mat_b_l1 holds [BLOCK_K, 2*BLOCK_N]:
-    #   slot 0 → cols [0      : BLOCK_N  ]  (even K iterations)
-    #   slot 1 → cols [BLOCK_N : 2*BLOCK_N] (odd  K iterations)
-    mat_a_l1 = tle.dsa.alloc([2 * BLOCK_M, BLOCK_K], dtype=mat_a.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
-    mat_b_l1 = tle.dsa.alloc([BLOCK_K, 2 * BLOCK_N], dtype=mat_b.dtype.element_ty, mem_addr_space=tle.dsa.ascend.L1)
+    # On-chip buffers: A/B in L1, accumulator in L0C
+    mat_a_l1 = tile_alloc([BLOCK_M, BLOCK_K], mat_a.dtype.element_ty, tle.language.dsa.ascend.L1)
+    mat_b_l1 = tile_alloc([BLOCK_K, BLOCK_N], mat_b.dtype.element_ty, tle.language.dsa.ascend.L1)
 
     # Each core processes output blocks in round-robin
     for block_idx in range(pid, NUM_BLOCKS, NUM_CORES):
@@ -84,42 +76,25 @@ def matmul_kernel(
         b_block_ptr = tl.make_block_ptr(mat_b, (K, N), (N, 1), (0, n_start), (BLOCK_K, BLOCK_N), (1, 0))
 
         mat_c_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        # K-loop: ping-pong between slot 0 and slot 1 of each 2x L1 buffer.
-        #
-        # k_idx % 2 == 0  →  A slot: row-offset 0,       B slot: col-offset 0
-        # k_idx % 2 == 1  →  A slot: row-offset BLOCK_M,  B slot: col-offset BLOCK_N
-        #
-        # Because both slots are written and read on alternating iterations the
-        # compiler cannot prove either half is dead and must keep the full 2x
-        # allocation live.
+        # K-loop: load A/B tiles from GM to L1, then dot
         for k_idx in range(0, NUM_K_BLOCKS):
-            # Compute the row / col offset for this iteration's slot.
-            # tl.where on constexpr-shaped scalars gives a runtime-varying
-            # but type-stable offset that prevents constant folding.
-            a_row_off = tl.where(k_idx % 2 == 0, 0, BLOCK_M)
-            b_col_off = tl.where(k_idx % 2 == 0, 0, BLOCK_N)
-
-            # ── A: insert the incoming GM tile into the active slot, then
-            #    extract it back out for use in tl.dot.
-            a_l1_full = tle.dsa.to_tensor(mat_a_l1, writable=True)
-            a_l1_updated = tle.dsa.insert_slice(a_l1_full, tl.load(a_block_ptr), offsets=[a_row_off, 0],
-                                                sizes=[BLOCK_M, BLOCK_K], strides=[1, 1])
-            a_tile = tle.dsa.extract_slice(a_l1_updated, offsets=[a_row_off, 0], sizes=[BLOCK_M, BLOCK_K],
-                                           strides=[1, 1])
-
-            # ── B: same ping-pong pattern for the [BLOCK_K, 2*BLOCK_N] buffer.
-            b_l1_full = tle.dsa.to_tensor(mat_b_l1, writable=True)
-            b_l1_updated = tle.dsa.insert_slice(b_l1_full, tl.load(b_block_ptr), offsets=[0, b_col_off],
-                                                sizes=[BLOCK_K, BLOCK_N], strides=[1, 1])
-            b_tile = tle.dsa.extract_slice(b_l1_updated, offsets=[0, b_col_off], sizes=[BLOCK_K, BLOCK_N],
-                                           strides=[1, 1])
+            # Copy A tile
+            tile_copy(a_block_ptr, mat_a_l1, [BLOCK_M, BLOCK_K])
+            # Copy B tile
+            tile_copy(b_block_ptr, mat_b_l1, [BLOCK_K, BLOCK_N])
 
             # Accumulate: C += A @ B
-            mat_c_acc = tl.dot(a_tile, b_tile, mat_c_acc, out_dtype=tl.float32)
+            mat_c_acc = tl.dot(tile_to_tensor(mat_a_l1, writable=False), tile_to_tensor(mat_b_l1, writable=False),
+                               mat_c_acc, out_dtype=tl.float32)
 
             # Advance block pointers along K
             a_block_ptr = tl.advance(a_block_ptr, [0, BLOCK_K])
             b_block_ptr = tl.advance(b_block_ptr, [BLOCK_K, 0])
+
+        # Load residual tile [BLOCK_M, BLOCK_N] and add element-wise
+        residual_tile = tl.load(
+            tl.make_block_ptr(residual, (M, N), (N, 1), (m_start, n_start), (BLOCK_M, BLOCK_N), (1, 0)))
+        mat_c_acc += residual_tile.to(tl.float32)
 
         # Store result back to GM
         tl.store(tl.make_block_ptr(mat_c, (M, N), (N, 1), (m_start, n_start), (BLOCK_M, BLOCK_N), (1, 0)),
@@ -129,14 +104,16 @@ def matmul_kernel(
 # =============================================================================
 #  Host-side launch
 # =============================================================================
-def call(mat_a, mat_b):
+def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES, debug_compile=False):
     m = mat_a.shape[0]
     k = mat_a.shape[1]
     n = mat_b.shape[1]
     mat_c = torch.empty(m, n, dtype=mat_a.dtype, device=mat_a.device)
-    num_cores = get_number_cores()
-    matmul_kernel[(num_cores, )](mat_a, mat_b, mat_c, m, n, k, num_cores, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-                                 BLOCK_K=BLOCK_K, custom_pipeline=pipeline, debug=True)
+    compile_options = {}
+    if debug_compile:
+        compile_options["debug"] = True
+    matmul_add_residual_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, m, n, k, num_cores, BLOCK_M=BLOCK_M,
+                                              BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, custom_pipeline="hfusion-reorder-ops,auto-blockify-parallel-loop,hivm-mark-multi-buffer#1,hivm-enable-multi-buffer,hivm-bind-sub-block,hivm-partition-and-bind-sub-block,loop-invariant-code-motion,loop-invariant-subset-hoisting,hivm-mark-stride-align,hivm-clone-tensor-empty,hivm-sink-op-to-consumer-in-loop,hivm-inject-block-sync,hivm-auto-infer-buffer-size#1,convert-arith-to-affine#4,hivm-constantize-buffer-size#1,hivm-set-buffer-size#1#2,hivm-plan-memory#1",**compile_options)
     return mat_c
 
 
@@ -156,18 +133,19 @@ class _DumpOptions:
     sanitize_overflow = False
 
 
-def _matmul_signature():
+def _matmul_add_residual_signature():
     """Static signature for ast_to_ttir — non-constexpr args only."""
     return {
         "mat_a": "*fp16",
         "mat_b": "*fp16",
         "mat_c": "*fp16",
+        "residual": "*fp16",
         "M": "i32",
     }
 
 
-def _compile_matmul_module(M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_kernel to the frontend module that contains tile.* ops."""
+def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
+    """Compile matmul_add_residual_kernel to TTIR and write to *path*."""
     from triton.compiler.compiler import ASTSource
     from triton.compiler.code_generator import ast_to_ttir
     from triton._C.libtriton import ir
@@ -175,7 +153,10 @@ def _compile_matmul_module(M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 
     os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
 
-    signature = _matmul_signature()
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_triton.mlir")
+
+    signature = _matmul_add_residual_signature()
     constants = {
         "N": N,
         "K": K,
@@ -185,7 +166,7 @@ def _compile_matmul_module(M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
         "BLOCK_K": BLOCK_K,
     }
 
-    src = ASTSource(matmul_kernel.fn, signature, constants)
+    src = ASTSource(matmul_add_residual_kernel.fn, signature, constants)
     context = ir.context()
     ir.load_dialects(context)
     tle_ir.load_dialects(context)
@@ -197,45 +178,17 @@ def _compile_matmul_module(M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
         pass
 
     codegen_fns = {"min_dot_size": lambda lhsType, rhsType: (1, 1, 1)}
-    module = ast_to_ttir(matmul_kernel, src, context, _DumpOptions(), codegen_fns, {})
+    module = ast_to_ttir(matmul_add_residual_kernel, src, context, _DumpOptions(), codegen_fns, {})
 
     ok = module.verify()
     if not ok:
-        raise RuntimeError("_compile_matmul_module: module.verify() failed")
-    return module
+        raise RuntimeError("dump_ttir: module.verify() failed")
 
-
-def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
-    """Compile matmul_kernel to TTIR and write to *path*."""
-    if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_ttir.mlir")
-
-    module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
     mlir = str(module)
     if path:
         with open(path, "w") as f:
             f.write(mlir)
-        print(f"[dump_ttir] module.verify() = True; wrote TTIR ({len(mlir)} chars) to {path}")
-
-    if return_module:
-        return module
-    return mlir
-
-
-def dump_tileir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES, return_module=False):
-    """Dump the frontend TileIR stage before TileIR-to-HIVM lowering."""
-    if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_tileir.mlir")
-
-    module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
-    mlir = str(module)
-    if "tile." not in mlir:
-        raise RuntimeError("dump_tileir: expected tile.* ops in frontend IR")
-
-    if path:
-        with open(path, "w") as f:
-            f.write(mlir)
-        print(f"[dump_tileir] module.verify() = True; wrote TileIR ({len(mlir)} chars) to {path}")
+        print(f"[dump_ttir] wrote TTIR ({len(mlir)} chars) to {path}")
 
     if return_module:
         return module
@@ -246,7 +199,7 @@ def dump_tileir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 #  Full Linalg IR dump (TTIR → TileIR → Linalg lowering)
 # =============================================================================
 def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_kernel through full TileIR → Linalg lowering pipeline.
+    """Compile matmul_add_residual_kernel through full TileIR → Linalg lowering pipeline.
 
     Pipeline:
       ① tileir_to_hivm            — tile.* → memref/hivm
@@ -256,6 +209,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
       ④ bubble_up + structure(r2)
       ④b inline + canonicalize
       ⑤ triton_to_linalg_incubated
+      ⑤c fold_staging_copy
       ⑤b erase_linalg_casts (post)
       ⑥ final canonicalize + CSE + DCE
 
@@ -264,11 +218,11 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     from triton._C.libtriton import ir, passes, ascend
 
     # Step 1: compile to TTIR — get module directly (avoids reparse/dialect issues)
-    module = _compile_matmul_module(M=M, N=N, K=K, NUM_CORES=NUM_CORES)
+    module = dump_ttir(path=None, M=M, N=N, K=K, NUM_CORES=NUM_CORES, return_module=True)
     context = module.context
 
     if path is None:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "native_matmul_dsa_linalg.mlir")
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_triton_linalg.mlir")
 
     # ── ① TileIR → HIVM ──────────────────────────────────────────────────
     pm = ir.pass_manager(context)
@@ -286,14 +240,14 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 
     # ── ② Structured (r1) + discrete mask ────────────────────────────────
     pm = ir.pass_manager(context)
-    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
-    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False)
+    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    ascend.passes.ttir.add_discrete_mask_access_conversion(pm, False, False, False)
     pm.run(module)
     print(f"[dump_linalg] ② structure(r1)+discrete_mask: verify={module.verify()}", flush=True)
 
     # ── ③ Unstructured + HIVM + HFusion + LLVM ──────────────────────────
     pm = ir.pass_manager(context)
-    ascend.passes.ttir.add_triton_to_unstructure_incubated(pm, False, False)
+    ascend.passes.ttir.add_triton_to_unstructure(pm, False, False)
     ascend.passes.ttir.add_triton_to_hivm(pm)
     ascend.passes.ttir.add_triton_to_hfusion(pm)
     ascend.passes.ttir.add_triton_to_llvm(pm)
@@ -303,7 +257,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     # ── ④ Bubble-up + structured (r2) ────────────────────────────────────
     pm = ir.pass_manager(context)
     ascend.passes.ttir.add_bubble_up_operation(pm)
-    ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
+    # ascend.passes.ttir.add_triton_to_structure_incubated(pm, False, False, False)
     pm.run(module)
     print(f"[dump_linalg] ④ bubble_up+structure(r2): verify={module.verify()}", flush=True)
 
@@ -317,7 +271,7 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     # ── ⑤ Triton → Linalg ───────────────────────────────────────────────
     try:
         pm = ir.pass_manager(context)
-        ascend.passes.ttir.add_triton_to_linalg_incubated(pm, False, True, False, False, False)
+        ascend.passes.ttir.add_triton_to_linalg(pm, False, True, False, False, False)
         pm.run(module)
         print(f"[dump_linalg] ⑤ triton_to_linalg_incubated: verify={module.verify()}", flush=True)
     except RuntimeError as e:
@@ -358,16 +312,19 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
 #  CLI entry point
 # =============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Matmul kernel (tle.dsa.alloc/copy/to_tensor + tl.dot)")
+    parser = argparse.ArgumentParser(description="Matmul + residual kernel (C = A @ B + residual)")
     parser.add_argument("--M", type=int, default=_DEFAULT_M)
     parser.add_argument("--N", type=int, default=_DEFAULT_N)
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
     parser.add_argument("--num-cores", type=int, default=None)
     parser.add_argument("--no-check", action="store_true")
+    parser.add_argument(
+        "--debug-compile",
+        action="store_true",
+        help="Print the backend compiler command.",
+    )
     parser.add_argument("--dump-ttir", nargs="?", const="", default=None,
                         help="Dump TTIR to PATH and exit; no device needed.")
-    parser.add_argument("--dump-tileir", nargs="?", const="", default=None,
-                        help="Dump frontend TileIR with tile.* ops to PATH and exit; no device needed.")
     parser.add_argument("--dump-linalg", nargs="?", const="", default=None,
                         help="Dump Linalg IR to PATH and exit; no device needed.")
     args = parser.parse_args()
@@ -379,10 +336,6 @@ if __name__ == "__main__":
         dump_ttir(path=(args.dump_ttir or None), M=M, N=N, K=K, NUM_CORES=num_cores)
         raise SystemExit(0)
 
-    if args.dump_tileir is not None:
-        dump_tileir(path=(args.dump_tileir or None), M=M, N=N, K=K, NUM_CORES=num_cores)
-        raise SystemExit(0)
-
     if args.dump_linalg is not None:
         dump_linalg(path=(args.dump_linalg or None), M=M, N=N, K=K, NUM_CORES=num_cores)
         raise SystemExit(0)
@@ -392,11 +345,12 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     mat_a = torch.randn((M, K), dtype=torch.float16, device=device)
     mat_b = torch.randn((K, N), dtype=torch.float16, device=device)
+    residual = torch.randn((M, N), dtype=torch.float16, device=device)
 
-    mat_c = call(mat_a, mat_b)
+    mat_c = call(mat_a, mat_b, residual, num_cores, debug_compile=args.debug_compile)
 
     if not args.no_check:
-        ref = torch.matmul(mat_a.float(), mat_b.float()).to(torch.float16)
+        ref = (torch.matmul(mat_a.float(), mat_b.float()) + residual.float()).to(torch.float16)
         torch.testing.assert_close(ref, mat_c, rtol=1e-2, atol=1e-2)
         print("Test Passed!")
     else:
