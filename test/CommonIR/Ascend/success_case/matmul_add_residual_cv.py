@@ -247,8 +247,7 @@ def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES):
     # GM workspace: one [BLOCK_M, BLOCK_N] fp16 slot per core
     workspace = torch.empty(num_cores, BLOCK_M, BLOCK_N, dtype=mat_a.dtype, device=mat_a.device)
     matmul_add_residual_cv_kernel[(num_cores, )](mat_a, mat_b, mat_c, residual, workspace, m, n, k, num_cores,
-                                                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-                                                 debug=True)
+                                                 BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, debug=True)
     return mat_c
 
 
@@ -332,13 +331,13 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
 
 
 # =============================================================================
-#  Full Linalg IR dump (TTIR → TileIR → Linalg lowering)
+#  Full Linalg IR dump (TTIR → CommonIR → Linalg lowering)
 # =============================================================================
 def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_add_residual_cv_kernel through full TileIR → Linalg lowering pipeline.
+    """Compile matmul_add_residual_cv_kernel through full CommonIR → Linalg lowering pipeline.
 
     Pipeline:
-      ① tileir_to_hivm            — tile.* → memref/hivm
+      ① commonir_to_hivm            — tile.* → memref/hivm
       ①b erase_linalg_casts       — eliminate unrealized casts
       ② structure(r1) + discrete mask
       ③ unstructure + hivm + hfusion + llvm
@@ -360,12 +359,12 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_cv_linalg.mlir")
 
-    # ── ① TileIR → HIVM ──────────────────────────────────────────────────
+    # ── ① CommonIR → HIVM ──────────────────────────────────────────────────
     pm = ir.pass_manager(context)
     passes.common.add_inliner(pm)
-    ascend.passes.ttir.add_tileir_to_hivm(pm)
+    ascend.passes.ttir.add_commonir_to_hivm(pm)
     pm.run(module)
-    print(f"[dump_linalg] ① tileir_to_hivm: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] ① commonir_to_hivm: verify={module.verify()}", flush=True)
 
     # ── ①b Erase unrealized_conversion_cast ops ──────────────────────────
     # pm = ir.pass_manager(context)

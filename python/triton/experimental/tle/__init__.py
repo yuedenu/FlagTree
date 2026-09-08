@@ -1,19 +1,4 @@
-# flagtree tle
-from .distributed import (
-    B,
-    P,
-    S,
-    ShardedTensor,
-    ShardingSpec,
-    device_mesh,
-    distributed_barrier,
-    distributed_dot,
-    make_sharded_tensor,
-    remote,
-    reshard,
-    shard_id,
-    sharding,
-)
+from . import backends
 
 from . import language
 
@@ -85,7 +70,9 @@ def tle_patch_for_triton_compile():
         # ir.context() will return a new MLIRContext each time, here should keep the same context
         cur_context = ir.context()
         tle_ir.load_dialects(cur_context)
-        tle_ir.dsa_ir.load_tile_dialects(cur_context)
+        # commonir: load tile.* dialect only when the Ascend DSA plugin is present.
+        if hasattr(tle_ir, "dsa_ir"):
+            tle_ir.dsa_ir.load_tile_dialects(cur_context)
 
         original_context_fn = ir.context
 
@@ -196,26 +183,17 @@ def __getattr__(name):
         from .language import dsa
         globals()[name] = dsa
         return dsa
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        return getattr(backends, name)
+    except AttributeError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
-    "device_mesh",
-    "S",
-    "P",
-    "B",
-    "sharding",
-    "ShardingSpec",
-    "ShardedTensor",
-    "make_sharded_tensor",
-    "reshard",
-    "remote",
-    "shard_id",
-    "distributed_barrier",
-    "distributed_dot",
     "language",
     "dsa",
     "scope",
+    *backends.ops(),
 ]
 
 if raw is not None:

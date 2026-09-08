@@ -37,7 +37,7 @@ def _binary_op_type_checking(input: tl.tensor, other: tl.tensor, builder: ir.bui
 
 def copy(src, dst, shape: List[Union[tl.constexpr, int]], inter_no_alias: bool, builder: ir.builder):
     """
-    Generate a unified TileIR copy op.
+    Generate a unified CommonIR copy op.
 
     The CommonIR POC needs TLE DSA and future GPGPU paths to share one IR
     vocabulary. Therefore the public tle.dsa.copy frontend emits tile.copy
@@ -47,21 +47,23 @@ def copy(src, dst, shape: List[Union[tl.constexpr, int]], inter_no_alias: bool, 
 
 
 def _tile_buffer_binary_op(input: buffer, other: buffer, result: buffer, op_name: str, builder: ir.builder):
+    # commonir: route buffer arithmetic through tile.to_tensor/tile.store_tensor.
     lhs = tile_to_tensor(input, False, builder)
     rhs = tile_to_tensor(other, False, builder)
+    semantic = tl_semantic.TritonSemantic(builder)
 
     if op_name == "add":
-        value = tl_semantic.add(lhs, rhs, True, builder)
+        value = semantic.add(lhs, rhs, True)
     elif op_name == "sub":
-        value = tl_semantic.sub(lhs, rhs, True, builder)
+        value = semantic.sub(lhs, rhs, True)
     elif op_name == "mul":
-        value = tl_semantic.mul(lhs, rhs, True, builder)
+        value = semantic.mul(lhs, rhs, True)
     elif op_name == "div":
-        value = tl_semantic.truediv(lhs, rhs, builder)
+        value = semantic.truediv(lhs, rhs)
     elif op_name == "max":
-        value = tl_semantic.maximum(lhs, rhs, tl.PropagateNan.NONE, builder)
+        value = semantic.maximum(lhs, rhs, tl.PropagateNan.NONE)
     elif op_name == "min":
-        value = tl_semantic.minimum(lhs, rhs, tl.PropagateNan.NONE, builder)
+        value = semantic.minimum(lhs, rhs, tl.PropagateNan.NONE)
     else:
         raise ValueError(f"unsupported tile buffer binary op: {op_name}")
 
@@ -93,7 +95,7 @@ def min(input: buffer, other: buffer, result: buffer, builder: ir.builder):
 
 
 def alloc(etype: tl.dtype, shape: List[tl.constexpr], address_space: address_space, builder: ir.builder) -> buffer:
-    """Allocate a unified TileIR buffer for the public tle.dsa.alloc API."""
+    """Allocate a unified CommonIR buffer for the public tle.dsa.alloc API."""
     return tile_alloc(etype, shape, address_space, builder)
 
 
@@ -103,12 +105,12 @@ def to_buffer(
     bind_buffer: buffer,
     builder: ir.builder,
 ) -> buffer:
-    """Convert a ranked tensor to a unified TileIR buffer."""
+    """Convert a ranked tensor to a unified CommonIR buffer."""
     return tile_to_buffer(tensor, address_space, bind_buffer, builder)
 
 
 def to_tensor(memref: buffer, writable: bool, builder: ir.builder, target_shape=None) -> tl.tensor:
-    """Convert a unified TileIR buffer back to a ranked tensor."""
+    """Convert a unified CommonIR buffer back to a ranked tensor."""
     return tile_to_tensor(memref, writable, builder, target_shape=target_shape)
 
 
@@ -153,12 +155,12 @@ def extract_element(src: tl.tensor, indice: List[tl.tensor], builder: ir.builder
 
 def subview(src: buffer, offsets: List[tl.tensor], sizes: List[tl.constexpr], strides: List[tl.constexpr],
             builder: ir.builder) -> buffer:
-    """Extract a subview using unified TileIR for the public tle.dsa.subview API."""
+    """Extract a subview using unified CommonIR for the public tle.dsa.subview API."""
     return tile_subview(src, offsets, sizes, strides, builder)
 
 
 # ==============================================================================
-# TileIR semantic functions — emit tile.* ops
+# CommonIR semantic functions — emit tile.* ops
 # ==============================================================================
 
 
@@ -184,7 +186,7 @@ def tile_copy(src, dst, shape: List[Union[tl.constexpr, int]], inter_no_alias: b
 
 
 def tile_store_tensor(tensor: tl.tensor, dst: buffer, builder: ir.builder):
-    """Store a ranked tensor value back into a TileIR buffer."""
+    """Store a ranked tensor value back into a CommonIR buffer."""
     if not isinstance(dst, buffer):
         raise TypeError("dst must be a buffer")
     builder.create_tile_store_tensor(tensor.handle, dst.handle)
@@ -196,7 +198,7 @@ def tile_to_buffer(
     bind_buffer: buffer,
     builder: ir.builder,
 ) -> buffer:
-    """Convert a ranked tensor to a TileIR buffer using tile.store_tensor."""
+    """Convert a ranked tensor to a CommonIR buffer using tile.store_tensor."""
     if not isinstance(tensor.shape, (tl.tuple, tuple, list)) or not tensor.shape:
         raise TypeError("scalar type cannot be converted to buffer")
 
@@ -339,3 +341,47 @@ def tile_cube_launch(a: buffer, b: buffer, acc: buffer, stage_a: buffer, stage_b
 def tile_cube_wait(builder: ir.builder):
     """Wait for Cube work using tile.cube_wait."""
     builder.create_tile_cube_wait()
+
+
+def tile_concat(lhs: tl.tensor, rhs: tl.tensor, dim: int, builder: ir.builder) -> tl.tensor:
+    """Concatenate two tensors along a dimension using tile.concat.
+
+    Args:
+        lhs: First tensor to concatenate
+        rhs: Second tensor to concatenate
+        dim: Dimension along which to concatenate
+        builder: IR builder instance
+
+    Returns:
+        Concatenated tensor
+    """
+    if not isinstance(lhs, tl.tensor):
+        raise TypeError("lhs must be a tensor")
+    if not isinstance(rhs, tl.tensor):
+        raise TypeError("rhs must be a tensor")
+
+    # Unwrap shapes first to handle constexpr correctly
+    lhs_shape = list(tl._unwrap_shape(lhs.shape))
+    rhs_shape = list(tl._unwrap_shape(rhs.shape))
+
+    if len(lhs_shape) != len(rhs_shape):
+        raise ValueError(f"Cannot concat tensors with different ranks: {len(lhs_shape)} vs {len(rhs_shape)}")
+
+    if dim < 0 or dim >= len(lhs_shape):
+        raise ValueError(f"dim {dim} out of range for tensor with {len(lhs_shape)} dimensions")
+
+    for i in range(len(lhs_shape)):
+        if i != dim and lhs_shape[i] != rhs_shape[i]:
+            raise ValueError(f"Shape mismatch at dimension {i}: {lhs_shape[i]} vs {rhs_shape[i]}")
+
+    # Compute output shape
+    out_shape = lhs_shape.copy()
+    out_shape[dim] = lhs_shape[dim] + rhs_shape[dim]
+
+    # Create tile.concat op
+    result_handle = builder.create_tile_concat(lhs.handle, rhs.handle, dim)
+
+    # Wrap result
+    result_ty = tl.block_type(lhs.dtype, out_shape)
+    return tl.tensor(result_handle, result_ty)
+

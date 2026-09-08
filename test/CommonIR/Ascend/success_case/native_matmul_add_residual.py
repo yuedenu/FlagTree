@@ -104,7 +104,7 @@ def matmul_add_residual_kernel(
 # =============================================================================
 #  Host-side launch
 # =============================================================================
-def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES, debug_compile=False):
+def call(mat_a, mat_b, residual, num_cores=_DEFAULT_NUM_CORES):
     m = mat_a.shape[0]
     k = mat_a.shape[1]
     n = mat_b.shape[1]
@@ -196,13 +196,13 @@ def dump_ttir(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DE
 
 
 # =============================================================================
-#  Full Linalg IR dump (TTIR → TileIR → Linalg lowering)
+#  Full Linalg IR dump (TTIR → CommonIR → Linalg lowering)
 # =============================================================================
 def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_DEFAULT_NUM_CORES):
-    """Compile matmul_add_residual_kernel through full TileIR → Linalg lowering pipeline.
+    """Compile matmul_add_residual_kernel through full CommonIR → Linalg lowering pipeline.
 
     Pipeline:
-      ① tileir_to_hivm            — tile.* → memref/hivm
+      ① commonir_to_hivm            — tile.* → memref/hivm
       ①b erase_linalg_casts       — eliminate unrealized casts
       ② structure(r1) + discrete mask
       ③ unstructure + hivm + hfusion + llvm
@@ -224,12 +224,12 @@ def dump_linalg(path=None, M=_DEFAULT_M, N=_DEFAULT_N, K=_DEFAULT_K, NUM_CORES=_
     if path is None:
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "matmul_add_residual_triton_linalg.mlir")
 
-    # ── ① TileIR → HIVM ──────────────────────────────────────────────────
+    # ── ① CommonIR → HIVM ──────────────────────────────────────────────────
     pm = ir.pass_manager(context)
     passes.common.add_inliner(pm)
-    ascend.passes.ttir.add_tileir_to_hivm(pm)
+    ascend.passes.ttir.add_commonir_to_hivm(pm)
     pm.run(module)
-    print(f"[dump_linalg] ① tileir_to_hivm: verify={module.verify()}", flush=True)
+    print(f"[dump_linalg] ① commonir_to_hivm: verify={module.verify()}", flush=True)
 
     # ── ①b Erase unrealized_conversion_cast ops ──────────────────────────
     # pm = ir.pass_manager(context)
@@ -318,11 +318,6 @@ if __name__ == "__main__":
     parser.add_argument("--K", type=int, default=_DEFAULT_K)
     parser.add_argument("--num-cores", type=int, default=None)
     parser.add_argument("--no-check", action="store_true")
-    parser.add_argument(
-        "--debug-compile",
-        action="store_true",
-        help="Print the backend compiler command.",
-    )
     parser.add_argument("--dump-ttir", nargs="?", const="", default=None,
                         help="Dump TTIR to PATH and exit; no device needed.")
     parser.add_argument("--dump-linalg", nargs="?", const="", default=None,
@@ -347,7 +342,7 @@ if __name__ == "__main__":
     mat_b = torch.randn((K, N), dtype=torch.float16, device=device)
     residual = torch.randn((M, N), dtype=torch.float16, device=device)
 
-    mat_c = call(mat_a, mat_b, residual, num_cores, debug_compile=args.debug_compile)
+    mat_c = call(mat_a, mat_b, residual, num_cores)
 
     if not args.no_check:
         ref = (torch.matmul(mat_a.float(), mat_b.float()) + residual.float()).to(torch.float16)
